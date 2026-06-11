@@ -164,7 +164,7 @@ class AgentReview:
     agent_results: list[AgentResult] = dataclasses.field(default_factory=list)
     token_budget: int = 0
     prompt_tokens_estimate: int = 0
-    llm_provider: str = "heuristic"
+    llm_provider: str = "deterministic"
     llm_notes: str = ""
 
 
@@ -1301,7 +1301,7 @@ def decide_agent_action(candidate: Candidate, evidence_score: float, risk_result
     return "Pass", "The agent review does not find enough support to prioritize it."
 
 
-def build_agent_review(candidate: Candidate, token_budget: int, provider: str = "heuristic") -> AgentReview:
+def build_agent_review(candidate: Candidate, token_budget: int, provider: str = "deterministic") -> AgentReview:
     evidence_score, quality_reasons = evidence_quality(candidate)
     specialist_results = [
         agent_news(candidate),
@@ -1968,9 +1968,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--skip-agent-review", action="store_true")
     parser.add_argument(
         "--agent-provider",
-        choices=("heuristic", "openai"),
-        default=os.environ.get("AGENT_PROVIDER", "heuristic"),
-        help="Use heuristic agent review by default; set to openai to add a compact LLM overlay.",
+        choices=("deterministic", "openai"),
+        default=os.environ.get("AGENT_PROVIDER", "deterministic"),
+        help="Use deterministic agent review by default; set to openai to add a compact LLM overlay.",
     )
     parser.add_argument(
         "--agent-model",
