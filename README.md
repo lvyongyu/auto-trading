@@ -40,7 +40,7 @@ Run it once a week, ideally after the Friday close or before the Monday open:
 python3 src/event_bottom_fishing.py --top 10
 ```
 
-To generate the report and email it:
+To generate the report and email it from your own machine or any SMTP-enabled environment:
 
 ```bash
 python3 src/email_weekly_report.py --to lvyongyu@gmail.com
@@ -56,20 +56,22 @@ For Gmail, set `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, and use a Gmail app 
 
 ## GitHub Actions Schedule
 
-The repository includes `.github/workflows/weekly-stock-email.yml`.
+The repository includes `.github/workflows/weekly-stock-report.yml`.
 
 It runs every Monday at 13:00 UTC, before the US market open in both US daylight-saving and standard-time periods. You can also run it manually from the GitHub Actions tab with `workflow_dispatch`.
 
-Configure these repository secrets in GitHub:
+By default, the GitHub workflow does not need an SMTP server. It generates the report and creates a GitHub Issue with the full watchlist. If your GitHub notifications are enabled, GitHub will email you when the issue is created.
 
-- `SMTP_USERNAME`: Gmail address or SMTP username
-- `SMTP_PASSWORD`: Gmail app password or SMTP password
-- `SMTP_FROM`: optional sender address; usually the same as `SMTP_USERNAME`
-
-GitHub path:
+To receive it by email, make sure you are watching the repository:
 
 ```text
-Repository -> Settings -> Secrets and variables -> Actions -> New repository secret
+Repository -> Watch -> All Activity
+```
+
+Also confirm GitHub email notifications are enabled:
+
+```text
+GitHub -> Settings -> Notifications -> Email
 ```
 
 For a larger or smaller universe, edit `config/universe_sp100.txt`.

@@ -1,0 +1,55 @@
+name: Weekly event-driven stock report
+
+on:
+  schedule:
+    # Monday 13:00 UTC. This is before the US market open in both EDT and EST.
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+
+jobs:
+  create-weekly-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate watchlist
+        run: python3 src/event_bottom_fishing.py --top 10
+
+      - name: Create GitHub issue report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const outputDir = path.join(process.cwd(), "outputs");
+            const report = fs
+              .readdirSync(outputDir)
+              .filter((name) => name.startsWith("weekly_event_bottom_fishing_") && name.endsWith(".md"))
+              .sort()
+              .pop();
+
+            if (!report) {
+              throw new Error("No Markdown report found in outputs/");
+            }
+
+            const body = fs.readFileSync(path.join(outputDir, report), "utf8");
+            const date = new Date().toISOString().slice(0, 10);
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Weekly US event-driven stock watchlist - ${date}`,
+              body,
+              labels: ["weekly-report"]
+            });
