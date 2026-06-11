@@ -15,7 +15,39 @@ The system should not try to predict stock prices directly. Its value should com
 
 The output remains a research watchlist, not investment advice or an auto-trading instruction.
 
+## Terminology and Reality Check
+
+The first implementation should be described as an `agent-inspired modular pipeline`, not a full AI agent system.
+
+In the near-term design, each "agent" is a bounded research module:
+
+- It has a fixed responsibility.
+- It consumes known data sources.
+- It returns structured scores, evidence, concerns, and confidence.
+- It does not autonomously plan, choose tools, browse for missing evidence, or run multi-step investigations.
+
+This is still valuable because it makes the system auditable and easier to extend. However, it is not yet an AI agent in the stricter sense.
+
+A true LLM-assisted agent version would add:
+
+- Task-level goals per agent, such as "determine whether this selloff is temporary or structural"
+- Tool choice, such as deciding whether to read an 8-K, a 10-Q risk factor section, an earnings transcript, or multiple news sources
+- Multi-step reasoning and follow-up questions
+- Structured conclusions with evidence, counterarguments, missing data, and confidence
+- Debate between bull and bear interpretations
+- Memory of prior research notes and outcome feedback
+
+So the roadmap should be:
+
+```text
+Current screener
+  -> Agent-inspired modular research pipeline
+  -> LLM-assisted multi-agent research system
+```
+
 ## Target Architecture
+
+The long-term architecture is:
 
 ```text
 News Agent
@@ -34,11 +66,17 @@ Risk Agent
 Trade Agent
 ```
 
+For Phase 1, these are deterministic modules with agent-style outputs. In later phases, selected modules can become LLM-assisted agents where extra reasoning and tool choice add real value.
+
 ## Agent Responsibilities
 
 ### News Agent
 
 Purpose: detect fresh market-moving events.
+
+Near-term behavior: classify and score events from known news feeds.
+
+Future AI-agent behavior: decide which additional sources to verify, identify whether coverage is independent or syndicated, and summarize disagreement between credible sources.
 
 Inputs:
 
@@ -76,6 +114,10 @@ Example output:
 
 Purpose: verify whether the event has primary-source support.
 
+Near-term behavior: inspect available SEC metadata, recent filings, and company facts.
+
+Future AI-agent behavior: read specific filing sections, compare risk-factor changes, extract 8-K items, and judge whether management language supports or contradicts the market narrative.
+
 Inputs:
 
 - SEC company submissions
@@ -96,6 +138,10 @@ SEC evidence should outrank all secondary news. If Yahoo says a company has a ma
 ### Financial Agent
 
 Purpose: judge whether the company is worth bottom-fishing.
+
+Near-term behavior: calculate business quality, valuation, and structural risk from available metrics.
+
+Future AI-agent behavior: compare the company against peers, read management commentary, identify accounting distortions, and explain whether valuation improved enough to matter.
 
 Inputs:
 
@@ -123,6 +169,10 @@ This agent prevents low-quality companies from entering the focus list just beca
 
 Purpose: measure retail sentiment and narrative intensity.
 
+Near-term behavior: unavailable or low-weight placeholder until a reliable ingestion path exists.
+
+Future AI-agent behavior: cluster narratives, separate serious due diligence from hype, detect crowded trades, and flag one-sided sentiment as a risk.
+
 Inputs:
 
 - Future: Reddit API or Pushshift-style source if available
@@ -144,6 +194,10 @@ Reddit should have low source credibility by default. It can improve awareness o
 
 Purpose: judge whether the setup is stabilizing or still falling.
 
+Near-term behavior: calculate drawdown, short-term stabilization, volume, and falling-knife warnings.
+
+Future AI-agent behavior: compare against sector ETFs, identify regime changes, and produce timing-oriented questions rather than treating charts as proof of business value.
+
 Inputs:
 
 - Daily prices
@@ -164,6 +218,10 @@ Technical evidence should influence timing, not business quality.
 ## Debate Agent
 
 Purpose: combine agent outputs into bull and bear cases.
+
+Near-term behavior: deterministic aggregation of module outputs into bull case, bear case, open questions, and a debate score.
+
+Future AI-agent behavior: run an explicit bull-vs-bear review where one side challenges the other, then summarize what evidence would change the conclusion.
 
 Inputs:
 
@@ -196,6 +254,10 @@ Bear case:
 ## Risk Agent
 
 Purpose: block weak or dangerous setups from becoming focus candidates.
+
+Near-term behavior: apply hard rules and penalties.
+
+Future AI-agent behavior: inspect risk evidence, recognize unusual legal/accounting/financing concerns, and veto candidates where the apparent dip is likely structural.
 
 Inputs:
 
@@ -230,6 +292,10 @@ This should not place trades. It should classify the candidate:
 - `Watch`: monitor, but not top priority
 - `Pass`: not worth time this cycle
 - `Blocked`: risk/data quality makes the thesis unreliable
+
+Near-term behavior: convert scores and risk gates into a research action.
+
+Future AI-agent behavior: generate the next research plan, including what to verify before buying, what would invalidate the thesis, and what upcoming event matters most.
 
 Outputs:
 
@@ -407,7 +473,7 @@ Trade Agent
 
 ## Implementation Plan
 
-### Phase 1: Internal Agent Abstraction
+### Phase 1: Agent-Inspired Modular Pipeline
 
 No new external APIs.
 
@@ -422,6 +488,8 @@ No new external APIs.
 - Add Debate/Risk/Trade aggregation
 - Report agent table in Markdown and JSON
 
+This phase should avoid pretending the modules are autonomous AI agents. The main goal is clean structure, explainability, and a stable contract for later LLM-assisted work.
+
 ### Phase 2: Better Primary Documents
 
 - Download and parse recent 8-K text
@@ -429,21 +497,37 @@ No new external APIs.
 - Add earnings release detection
 - Add transcript ingestion if a reliable source is available
 
-### Phase 3: Reddit Agent
+### Phase 3: Selective LLM-Assisted Analysis
+
+Use LLM calls only where they provide clear value over rules:
+
+- Summarize SEC filing sections
+- Compare current and prior risk factors
+- Extract management tone from transcripts
+- Produce bull/bear arguments with citations
+- Identify missing evidence before a candidate is promoted to Focus
+
+Guardrails:
+
+- LLM output must cite source snippets or structured evidence IDs.
+- LLM confidence should not override source credibility.
+- The system must keep deterministic fallbacks when LLM calls fail.
+
+### Phase 4: Reddit Agent
 
 - Add Reddit ingestion
 - Score mention velocity and sentiment
 - Add meme/crowding risk
 - Keep Reddit low credibility unless backtested
 
-### Phase 4: Backtesting and Historical Hit Rate
+### Phase 5: Backtesting and Historical Hit Rate
 
 - Store daily outputs
 - Track forward returns and drawdowns
 - Learn source hit rates
 - Tune evidence quality weights
 
-### Phase 5: Trade Workflow
+### Phase 6: Trade Workflow
 
 Still no auto-trading by default.
 
@@ -460,4 +544,3 @@ Still no auto-trading by default.
 - Every final score must be explainable.
 - Every Focus candidate must include a bear case.
 - The system should prefer saying `Watch` over forcing a trade idea.
-
