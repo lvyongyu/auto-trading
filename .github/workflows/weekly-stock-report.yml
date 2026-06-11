@@ -43,13 +43,19 @@ jobs:
               throw new Error("No Markdown report found in outputs/");
             }
 
-            const body = fs.readFileSync(path.join(outputDir, report), "utf8");
+            const reportBody = fs.readFileSync(path.join(outputDir, report), "utf8");
             const date = new Date().toISOString().slice(0, 10);
+            const body = `@lvyongyu Weekly stock report is ready.\n\n${reportBody}`;
 
-            await github.rest.issues.create({
+            const issue = await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: `Weekly US event-driven stock watchlist - ${date}`,
               body,
-              labels: ["weekly-report"]
+              assignees: ["lvyongyu"]
             });
+
+            core.summary
+              .addHeading("Weekly stock report issue created")
+              .addLink(issue.data.html_url, issue.data.html_url)
+              .write();
