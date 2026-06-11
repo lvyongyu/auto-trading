@@ -41,22 +41,28 @@ The Markdown report is designed for a human reader. Each candidate includes:
 
 ## Testing Strategy
 
-This app does not need a heavy unit-test-first workflow to be useful. For this kind of research agent, the higher-value checks are end-to-end runs, data-source sanity checks, and report inspection.
+This project is built around a simple conviction: for an AI research agent, the truth lives in the full pipeline, not in isolated helper functions.
 
-Reasons unit tests are lower priority here:
+That means we do not optimize for a heavy unit-test-first process. We optimize for the checks that actually prove the app still works:
 
-- Most of the risk comes from live external data sources, not from pure in-memory business logic.
-- The useful behavior is the full pipeline result, not isolated helper functions in the abstract.
-- News, SEC, price, and LLM behavior change over time, so narrow unit tests can become noisy and brittle.
-- The main failure mode is bad research output or broken connectivity, which is better caught by integration smoke tests and daily runs.
-- The prompt and scoring surfaces are likely to evolve, so over-investing in unit tests early can slow iteration more than it helps.
+- Run the whole workflow end to end.
+- Verify the live public data sources still respond.
+- Inspect the generated Markdown and JSON outputs.
+- Catch broken prompts, stale assumptions, and flaky integrations early.
 
-Practical focus:
+Why this matters:
 
-- Keep deterministic helpers small and readable.
-- Add smoke tests for the daily pipeline when behavior settles.
-- Validate the generated Markdown and JSON output shape.
-- Check that the workflow still runs end to end against the live public sources.
+- The main risk is not a pure calculation bug, it is bad research output.
+- The system depends on external news, SEC, price, and LLM behavior that changes over time.
+- Narrow unit tests can be brittle when the prompt, source mix, and ranking logic are still evolving.
+- The fastest way to lose momentum is to overbuild tests for code that is still finding its shape.
+
+So the testing doctrine here is:
+
+- Keep helpers deterministic and readable.
+- Add smoke tests where they prove the pipeline still works.
+- Trust end-to-end runs more than tiny abstractions.
+- Let the daily report itself be the primary proof that the system is healthy.
 
 ## Daily Use
 
