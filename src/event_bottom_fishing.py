@@ -27,6 +27,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_UNIVERSE = os.path.join(ROOT, "config", "universe_sp100.txt")
 DEFAULT_ALIASES = os.path.join(ROOT, "config", "company_aliases.json")
 OUTPUT_DIR = os.path.join(ROOT, "outputs")
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+SEC_USER_AGENT = "auto-trading-research/0.1 lvyongyu@gmail.com"
 
 EVENT_KEYWORDS = {
     "earnings_miss": {
@@ -95,6 +98,24 @@ class PriceStats:
 
 
 @dataclasses.dataclass
+class FilingItem:
+    form: str
+    filing_date: str
+    report_date: str
+    accession_number: str
+    description: str
+
+
+@dataclasses.dataclass
+class DataConfidence:
+    level: str = "Low"
+    reasons: list[str] = dataclasses.field(default_factory=list)
+    sec_filings: list[FilingItem] = dataclasses.field(default_factory=list)
+    secondary_price: PriceStats | None = None
+    price_source_status: str = "not checked"
+
+
+@dataclasses.dataclass
 class Candidate:
     ticker: str
     score: float
@@ -110,6 +131,7 @@ class Candidate:
     deep_dive_decision: str = "Review"
     deep_dive_reasons: list[str] = dataclasses.field(default_factory=list)
     deep_dive_risks: list[str] = dataclasses.field(default_factory=list)
+    data_confidence: DataConfidence = dataclasses.field(default_factory=DataConfidence)
 
 
 def fetch_url(url: str, timeout: int = 12) -> bytes:
@@ -118,6 +140,18 @@ def fetch_url(url: str, timeout: int = 12) -> bytes:
         headers={
             "User-Agent": "Mozilla/5.0 event-bottom-fishing-agent/0.1",
             "Accept": "*/*",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read()
+
+
+def fetch_sec_url(url: str, timeout: int = 12) -> bytes:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": SEC_USER_AGENT,
+            "Accept": "application/json",
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -247,6 +281,108 @@ def fetch_price_stats(ticker: str) -> PriceStats | None:
         above_5d_low=(last / low_5 - 1) * 100,
         volume_ratio_5d_20d=avg_vol_5 / avg_vol_20 if avg_vol_20 else 0,
     )
+
+
+def parse_csv_rows(raw: bytes) -> list[dict[str, str]]:
+    lines = raw.decode("utf-8").strip().splitlines()
+    if len(lines) < 2:
+        return []
+    headers = lines[0].split(",")
+    rows = []
+    for line in lines[1:]:
+        values = line.split(",")
+        if len(values) == len(headers):
+            rows.append(dict(zip(headers, values)))
+    return rows
+
+
+def stooq_symbol(ticker: str) -> str:
+    return ticker.lower().replace("-", ".") + ".us"
+
+
+def fetch_stooq_price_stats(ticker: str) -> PriceStats | None:
+    end = dt.datetime.now(dt.timezone.utc).date()
+    start = end - dt.timedelta(days=220)
+    params = urllib.parse.urlencode(
+        {
+            "s": stooq_symbol(ticker),
+            "d1": start.strftime("%Y%m%d"),
+            "d2": end.strftime("%Y%m%d"),
+            "i": "d",
+        }
+    )
+    url = f"https://stooq.com/q/d/l/?{params}"
+    rows = parse_csv_rows(fetch_url(url))
+    closes = []
+    volumes = []
+    for row in rows:
+        try:
+            closes.append(float(row["Close"]))
+            volumes.append(float(row.get("Volume") or 0))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(closes) < 61 or len(volumes) < 25:
+        return None
+    last = closes[-1]
+    high_60 = max(closes[-60:])
+    low_5 = min(closes[-5:])
+    avg_vol_5 = sum(volumes[-5:]) / 5
+    avg_vol_20 = sum(volumes[-20:]) / 20
+    return PriceStats(
+        last_close=last,
+        change_5d=(last / closes[-6] - 1) * 100,
+        change_20d=(last / closes[-21] - 1) * 100,
+        drawdown_60d=(last / high_60 - 1) * 100,
+        above_5d_low=(last / low_5 - 1) * 100,
+        volume_ratio_5d_20d=avg_vol_5 / avg_vol_20 if avg_vol_20 else 0,
+    )
+
+
+def load_sec_ticker_map() -> dict[str, str]:
+    payload = json.loads(fetch_sec_url(SEC_TICKERS_URL).decode("utf-8"))
+    ticker_map = {}
+    for record in payload.values():
+        ticker = str(record.get("ticker", "")).upper()
+        cik = str(record.get("cik_str", "")).zfill(10)
+        if ticker and cik:
+            ticker_map[ticker] = cik
+    return ticker_map
+
+
+def fetch_recent_sec_filings(ticker: str, cik_by_ticker: dict[str, str], lookback_days: int) -> list[FilingItem]:
+    cik = cik_by_ticker.get(ticker.upper())
+    if not cik:
+        return []
+    payload = json.loads(fetch_sec_url(SEC_SUBMISSIONS_URL.format(cik=cik)).decode("utf-8"))
+    recent = payload.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    filing_dates = recent.get("filingDate", [])
+    report_dates = recent.get("reportDate", [])
+    accession_numbers = recent.get("accessionNumber", [])
+    descriptions = recent.get("primaryDocDescription", [])
+    cutoff = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=lookback_days)
+    interesting_forms = {"8-K", "10-Q", "10-K", "6-K", "20-F"}
+    filings = []
+    for index, form in enumerate(forms):
+        filing_date = filing_dates[index] if index < len(filing_dates) else ""
+        try:
+            parsed_date = dt.date.fromisoformat(filing_date)
+        except ValueError:
+            continue
+        if parsed_date < cutoff or form not in interesting_forms:
+            continue
+        filings.append(
+            FilingItem(
+                form=form,
+                filing_date=filing_date,
+                report_date=report_dates[index] if index < len(report_dates) else "",
+                accession_number=accession_numbers[index] if index < len(accession_numbers) else "",
+                description=descriptions[index] if index < len(descriptions) else "",
+            )
+        )
+        if len(filings) >= 5:
+            break
+    return filings
 
 
 def add_score(breakdown: dict[str, float], label: str, value: float) -> None:
@@ -413,6 +549,94 @@ def score_deep_dive(candidate: Candidate) -> tuple[float, list[str], list[str]]:
     return round(score, 2), reasons, risks
 
 
+def price_sources_match(primary: PriceStats, secondary: PriceStats) -> tuple[bool, str]:
+    close_delta = abs(primary.last_close / secondary.last_close - 1) * 100
+    drawdown_delta = abs(primary.drawdown_60d - secondary.drawdown_60d)
+    change_20d_delta = abs(primary.change_20d - secondary.change_20d)
+    status = (
+        f"Yahoo vs Stooq: close delta {close_delta:.2f}%, "
+        f"60-day drawdown delta {drawdown_delta:.2f} pts, "
+        f"20-day change delta {change_20d_delta:.2f} pts"
+    )
+    return close_delta <= 1.0 and drawdown_delta <= 3.0 and change_20d_delta <= 3.0, status
+
+
+def build_data_confidence(
+    candidate: Candidate,
+    sec_filings: list[FilingItem],
+    secondary_price: PriceStats | None,
+) -> DataConfidence:
+    reasons = []
+    score = 0
+    price_source_status = "Stooq price check unavailable"
+
+    if sec_filings:
+        score += 2
+        forms = ", ".join(sorted({filing.form for filing in sec_filings}))
+        reasons.append(f"SEC recent filings found ({forms}), giving a primary-source audit trail.")
+    else:
+        reasons.append("No recent 8-K/10-Q/10-K style SEC filing found within the lookback window.")
+
+    if secondary_price:
+        matches, price_source_status = price_sources_match(candidate.price, secondary_price)
+        if matches:
+            score += 2
+            reasons.append("Yahoo and Stooq price calculations are broadly consistent.")
+        else:
+            reasons.append("Yahoo and Stooq price calculations diverge enough to require manual price verification.")
+    else:
+        reasons.append("Second price source was unavailable, so the price signal relies on Yahoo only.")
+
+    category_counts = count_categories(candidate.events)
+    specific_events = [
+        event for event in candidate.events
+        if any(category != "macro_sector" for category in event.categories)
+    ]
+    if len(specific_events) >= 3:
+        score += 1
+        reasons.append("Multiple company-specific headlines support the event trail.")
+    elif category_counts.get("macro_sector") == len(candidate.events):
+        reasons.append("Event trail is mostly macro/sector commentary rather than company-specific evidence.")
+
+    if score >= 4:
+        level = "High"
+    elif score >= 2:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return DataConfidence(
+        level=level,
+        reasons=reasons,
+        sec_filings=sec_filings,
+        secondary_price=secondary_price,
+        price_source_status=price_source_status,
+    )
+
+
+def apply_data_confidence(candidates: list[Candidate], lookback_days: int, sleep_seconds: float) -> list[Candidate]:
+    try:
+        cik_by_ticker = load_sec_ticker_map()
+    except Exception:
+        cik_by_ticker = {}
+
+    for candidate in candidates:
+        sec_filings: list[FilingItem] = []
+        secondary_price: PriceStats | None = None
+        try:
+            sec_filings = fetch_recent_sec_filings(candidate.ticker, cik_by_ticker, lookback_days)
+            time.sleep(sleep_seconds)
+        except Exception:
+            sec_filings = []
+        try:
+            secondary_price = fetch_stooq_price_stats(candidate.ticker)
+            time.sleep(sleep_seconds)
+        except Exception:
+            secondary_price = None
+        candidate.data_confidence = build_data_confidence(candidate, sec_filings, secondary_price)
+    return candidates
+
+
 def apply_deep_dive(candidates: list[Candidate], focus_count: int) -> list[Candidate]:
     for candidate in candidates:
         score, reasons, risks = score_deep_dive(candidate)
@@ -544,6 +768,20 @@ def candidate_to_dict(candidate: Candidate) -> dict:
             "reasons": candidate.deep_dive_reasons,
             "risks": candidate.deep_dive_risks,
         },
+        "data_confidence": {
+            "level": candidate.data_confidence.level,
+            "reasons": candidate.data_confidence.reasons,
+            "price_source_status": candidate.data_confidence.price_source_status,
+            "secondary_price": (
+                dataclasses.asdict(candidate.data_confidence.secondary_price)
+                if candidate.data_confidence.secondary_price
+                else None
+            ),
+            "sec_filings": [
+                dataclasses.asdict(filing)
+                for filing in candidate.data_confidence.sec_filings
+            ],
+        },
         "price": dataclasses.asdict(candidate.price),
         "events": [
             {
@@ -582,8 +820,8 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
         handle.write("## Deep Dive Shortlist\n\n")
         if focus_candidates:
             handle.write("These are the 2-3 candidates the second-stage review thinks are most worth serious manual research this week.\n\n")
-            handle.write("| Rank | Ticker | Deep Dive Score | Original Score | Why It Is A Focus Candidate | Main Risk |\n")
-            handle.write("| ---: | --- | ---: | ---: | --- | --- |\n")
+            handle.write("| Rank | Ticker | Deep Dive Score | Data Confidence | Original Score | Why It Is A Focus Candidate | Main Risk |\n")
+            handle.write("| ---: | --- | ---: | --- | ---: | --- | --- |\n")
             for index, candidate in enumerate(
                 sorted(focus_candidates, key=lambda item: item.deep_dive_score, reverse=True),
                 start=1,
@@ -592,20 +830,22 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
                 risk = candidate.deep_dive_risks[0] if candidate.deep_dive_risks else ""
                 handle.write(
                     f"| {index} | {candidate.ticker} | {candidate.deep_dive_score:.2f} | "
-                    f"{candidate.score:.2f} | {markdown_escape(reason)} | {markdown_escape(risk)} |\n"
+                    f"{candidate.data_confidence.level} | {candidate.score:.2f} | "
+                    f"{markdown_escape(reason)} | {markdown_escape(risk)} |\n"
                 )
         else:
             handle.write("No candidates passed the deep-dive focus threshold this week.\n")
 
         handle.write("\n## Full Top-10 Event Screen\n\n")
-        handle.write("| Rank | Ticker | Decision | Bucket | Score | Deep Dive | Setup | Why It Made The List | Key Risk |\n")
-        handle.write("| ---: | --- | --- | --- | ---: | ---: | --- | --- | --- |\n")
+        handle.write("| Rank | Ticker | Decision | Confidence | Bucket | Score | Deep Dive | Setup | Why It Made The List | Key Risk |\n")
+        handle.write("| ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- |\n")
         for index, candidate in enumerate(candidates, start=1):
             risk = candidate.risks[0] if candidate.risks else ""
             reason = candidate.reasons[0] if candidate.reasons else ""
             handle.write(
                 f"| {index} | {candidate.ticker} | {candidate.deep_dive_decision} | "
-                f"{candidate.bucket} | {candidate.score:.2f} | {candidate.deep_dive_score:.2f} | "
+                f"{candidate.data_confidence.level} | {candidate.bucket} | "
+                f"{candidate.score:.2f} | {candidate.deep_dive_score:.2f} | "
                 f"{markdown_escape(candidate.thesis)} | "
                 f"{markdown_escape(reason)} | {markdown_escape(risk)} |\n"
             )
@@ -615,8 +855,23 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
             handle.write(f"**Score:** {candidate.score:.2f}  \n")
             handle.write(f"**Deep Dive Score:** {candidate.deep_dive_score:.2f}  \n")
             handle.write(f"**Deep Dive Decision:** {candidate.deep_dive_decision}  \n")
+            handle.write(f"**Data Confidence:** {candidate.data_confidence.level}  \n")
             handle.write(f"**Bucket:** {candidate.bucket}  \n")
             handle.write(f"**Setup:** {candidate.thesis}\n\n")
+
+            handle.write("**Data confidence**\n\n")
+            for reason in candidate.data_confidence.reasons:
+                handle.write(f"- {reason}\n")
+            handle.write(f"- {candidate.data_confidence.price_source_status}\n")
+            if candidate.data_confidence.sec_filings:
+                handle.write("\nRecent SEC filings:\n\n")
+                for filing in candidate.data_confidence.sec_filings:
+                    description = f" - {filing.description}" if filing.description else ""
+                    handle.write(
+                        f"- {filing.filing_date}: {filing.form}{description} "
+                        f"(accession {filing.accession_number})\n"
+                    )
+            handle.write("\n")
 
             handle.write("**Deep dive take**\n\n")
             for reason in candidate.deep_dive_reasons:
@@ -686,13 +941,16 @@ def scan(args: argparse.Namespace) -> list[Candidate]:
             continue
     candidates.sort(key=lambda item: item.score, reverse=True)
     if args.include_avoid:
-        return apply_deep_dive(candidates[: args.top], args.deep_dive_focus)
+        selected = apply_deep_dive(candidates[: args.top], args.deep_dive_focus)
+        return selected if args.skip_data_confidence else apply_data_confidence(selected, args.lookback_days, args.sleep)
 
     investable = [candidate for candidate in candidates if candidate.bucket != "D"]
     if len(investable) >= args.top:
-        return apply_deep_dive(investable[: args.top], args.deep_dive_focus)
+        selected = apply_deep_dive(investable[: args.top], args.deep_dive_focus)
+        return selected if args.skip_data_confidence else apply_data_confidence(selected, args.lookback_days, args.sleep)
     avoid = [candidate for candidate in candidates if candidate.bucket == "D"]
-    return apply_deep_dive((investable + avoid)[: args.top], args.deep_dive_focus)
+    selected = apply_deep_dive((investable + avoid)[: args.top], args.deep_dive_focus)
+    return selected if args.skip_data_confidence else apply_data_confidence(selected, args.lookback_days, args.sleep)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -706,6 +964,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--allow-broad-news", action="store_true")
     parser.add_argument("--include-avoid", action="store_true")
+    parser.add_argument("--skip-data-confidence", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 

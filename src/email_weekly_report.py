@@ -49,6 +49,7 @@ def generate_report(top: int, lookback_days: int, max_news: int) -> tuple[str, s
         sleep=0.15,
         allow_broad_news=False,
         include_avoid=False,
+        skip_data_confidence=False,
         verbose=False,
     )
     candidates = event_bottom_fishing.scan(scan_args)

@@ -8,12 +8,14 @@ It does **not** give investment advice or auto-trade. It ranks stocks that recen
 
 The first version intentionally avoids multi-factor valuation models. It focuses on:
 
-- Recent news events from Yahoo Finance RSS
+- Recent news events from Yahoo Finance RSS as the discovery source
 - Recent price drawdown
 - Whether the stock is stabilizing after the event
 - Whether the event appears potentially recoverable
 - Whether the event looks like a hard avoid, such as fraud, bankruptcy, delisting, or severe regulatory action
 - A ticker/company-name relevance filter to reduce broad market-news noise
+- Recent SEC filings as a primary-source event cross-check
+- Stooq daily prices, when available, as a second price source to check Yahoo price calculations
 
 ## Run
 
@@ -26,6 +28,7 @@ Outputs are written to `outputs/` as both Markdown and JSON.
 The Markdown report is designed for a human reader. Each candidate includes:
 
 - A deep-dive shortlist that narrows the top 10 down to 2-3 focus candidates
+- A `Data Confidence` rating based on SEC filing evidence and second-source price consistency
 - The setup summary
 - Why it made the list
 - What could break the thesis
@@ -94,6 +97,12 @@ After the first-stage top 10 is selected, a second-stage deep dive narrows the l
 - The stock shows at least early stabilization from its 5-day low
 - The risk is bounded enough to investigate, instead of being dominated by legal, delisting, fraud, or bankruptcy language
 - There are multiple company-specific headlines rather than only broad macro noise
+
+The report also assigns `Data Confidence`:
+
+- `High`: SEC filing evidence is present and Yahoo/Stooq price calculations broadly agree
+- `Medium`: at least one major cross-check supports the signal
+- `Low`: the candidate relies mostly on Yahoo headlines/prices and needs manual verification before serious research
 
 The output classes are:
 
