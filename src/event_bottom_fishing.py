@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Event-only weekly US stock bottom-fishing screener.
+"""Event-only daily US stock bottom-fishing screener.
 
 This script intentionally avoids valuation and broad multi-factor models.
 It uses public, no-key data sources and produces a research watchlist.
@@ -1120,7 +1120,7 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
         json.dump(payload, handle, indent=2, ensure_ascii=False)
 
     with open(md_path, "w", encoding="utf-8") as handle:
-        handle.write("# Weekly Event-Only Bottom-Fishing Watchlist\n\n")
+        handle.write("# Daily Event-Only Bottom-Fishing Watchlist\n\n")
         handle.write(f"Generated: {payload['generated_at']}\n\n")
         handle.write("This is a research watchlist, not investment advice or an auto-trading signal.\n\n")
 
@@ -1302,7 +1302,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 1
 
     today = dt.datetime.now().strftime("%Y-%m-%d")
-    path_prefix = os.path.join(OUTPUT_DIR, f"weekly_event_bottom_fishing_{today}")
+    path_prefix = os.path.join(OUTPUT_DIR, f"daily_event_bottom_fishing_{today}")
     json_path, md_path = write_outputs(candidates, path_prefix)
     print(f"Wrote {md_path}")
     print(f"Wrote {json_path}")

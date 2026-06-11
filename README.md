@@ -1,6 +1,6 @@
 # Event-Only US Stock Bottom-Fishing Agent
 
-This is a first-pass research agent for weekly US stock bottom-fishing candidates.
+This is a first-pass research agent for daily US stock bottom-fishing candidates.
 
 It does **not** give investment advice or auto-trade. It ranks stocks that recently sold off around identifiable events and produces a watchlist for further research.
 
@@ -37,9 +37,9 @@ The Markdown report is designed for a human reader. Each candidate includes:
 - A transparent score breakdown
 - Source event headlines
 
-## Weekly Use
+## Daily Use
 
-Run it once a week, ideally after the Friday close or before the Monday open:
+Run it once per trading day before the US market open:
 
 ```bash
 python3 src/event_bottom_fishing.py --top 10
@@ -48,7 +48,7 @@ python3 src/event_bottom_fishing.py --top 10
 To generate the report and email it from your own machine or any SMTP-enabled environment:
 
 ```bash
-python3 src/email_weekly_report.py --to lvyongyu@gmail.com
+python3 src/email_daily_report.py --to lvyongyu@gmail.com
 ```
 
 Email settings are loaded from environment variables or a local `.env` file. Start from the example:
@@ -61,9 +61,9 @@ For Gmail, set `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, and use a Gmail app 
 
 ## GitHub Actions Schedule
 
-The repository includes `.github/workflows/weekly-stock-report.yml`.
+The repository includes `.github/workflows/daily-stock-report.yml`.
 
-It runs every Monday at 13:00 UTC, before the US market open in both US daylight-saving and standard-time periods. You can also run it manually from the GitHub Actions tab with `workflow_dispatch`.
+It runs Monday through Friday at 13:00 UTC, before the US market open in both US daylight-saving and standard-time periods. It does not run on weekends. You can also run it manually from the GitHub Actions tab with `workflow_dispatch`.
 
 By default, the GitHub workflow does not need an SMTP server. It generates the report and creates a GitHub Issue with the full watchlist. If your GitHub notifications are enabled, GitHub will email you when the issue is created.
 

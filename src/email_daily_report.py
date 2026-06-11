@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the weekly event screener and email the Markdown report."""
+"""Run the daily event screener and email the Markdown report."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def generate_report(top: int, lookback_days: int, max_news: int) -> tuple[str, s
 
     os.makedirs(event_bottom_fishing.OUTPUT_DIR, exist_ok=True)
     today = dt.datetime.now().strftime("%Y-%m-%d")
-    path_prefix = os.path.join(event_bottom_fishing.OUTPUT_DIR, f"weekly_event_bottom_fishing_{today}")
+    path_prefix = os.path.join(event_bottom_fishing.OUTPUT_DIR, f"daily_event_bottom_fishing_{today}")
     return event_bottom_fishing.write_outputs(candidates, path_prefix)
 
 
@@ -106,9 +106,9 @@ def main() -> int:
         report_body = handle.read()
 
     today = dt.datetime.now().strftime("%Y-%m-%d")
-    subject = f"Weekly US event-driven stock watchlist - {today}"
+    subject = f"Daily US event-driven stock watchlist - {today}"
     send_email(subject, report_body, markdown_path, json_path, args.to)
-    print(f"Sent weekly report to {args.to}")
+    print(f"Sent daily report to {args.to}")
     print(f"Markdown: {markdown_path}")
     print(f"JSON: {json_path}")
     return 0

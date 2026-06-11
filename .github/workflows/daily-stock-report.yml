@@ -1,13 +1,13 @@
-name: Weekly event-driven stock report
+name: Daily event-driven stock report
 
 on:
   schedule:
-    # Monday 13:00 UTC. This is before the US market open in both EDT and EST.
-    - cron: "0 13 * * 1"
+    # Weekdays at 13:00 UTC. This is before the US market open in both EDT and EST.
+    - cron: "0 13 * * 1-5"
   workflow_dispatch:
 
 jobs:
-  create-weekly-report:
+  create-daily-report:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,7 +35,7 @@ jobs:
             const outputDir = path.join(process.cwd(), "outputs");
             const report = fs
               .readdirSync(outputDir)
-              .filter((name) => name.startsWith("weekly_event_bottom_fishing_") && name.endsWith(".md"))
+              .filter((name) => name.startsWith("daily_event_bottom_fishing_") && name.endsWith(".md"))
               .sort()
               .pop();
 
@@ -45,17 +45,17 @@ jobs:
 
             const reportBody = fs.readFileSync(path.join(outputDir, report), "utf8");
             const date = new Date().toISOString().slice(0, 10);
-            const body = `@lvyongyu Weekly stock report is ready.\n\n${reportBody}`;
+            const body = `@lvyongyu Daily stock report is ready.\n\n${reportBody}`;
 
             const issue = await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Weekly US event-driven stock watchlist - ${date}`,
+              title: `Daily US event-driven stock watchlist - ${date}`,
               body,
               assignees: ["lvyongyu"]
             });
 
             core.summary
-              .addHeading("Weekly stock report issue created")
+              .addHeading("Daily stock report issue created")
               .addLink(issue.data.html_url, issue.data.html_url)
               .write();
