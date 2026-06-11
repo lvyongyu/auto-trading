@@ -39,6 +39,25 @@ The Markdown report is designed for a human reader. Each candidate includes:
 - A transparent score breakdown
 - Source event headlines
 
+## Testing Strategy
+
+This app does not need a heavy unit-test-first workflow to be useful. For this kind of research agent, the higher-value checks are end-to-end runs, data-source sanity checks, and report inspection.
+
+Reasons unit tests are lower priority here:
+
+- Most of the risk comes from live external data sources, not from pure in-memory business logic.
+- The useful behavior is the full pipeline result, not isolated helper functions in the abstract.
+- News, SEC, price, and LLM behavior change over time, so narrow unit tests can become noisy and brittle.
+- The main failure mode is bad research output or broken connectivity, which is better caught by integration smoke tests and daily runs.
+- The prompt and scoring surfaces are likely to evolve, so over-investing in unit tests early can slow iteration more than it helps.
+
+Practical focus:
+
+- Keep deterministic helpers small and readable.
+- Add smoke tests for the daily pipeline when behavior settles.
+- Validate the generated Markdown and JSON output shape.
+- Check that the workflow still runs end to end against the live public sources.
+
 ## Daily Use
 
 Run it once per trading day before the US market open:
