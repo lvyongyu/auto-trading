@@ -28,6 +28,7 @@ Outputs are written to `outputs/` as both Markdown and JSON.
 The Markdown report is designed for a human reader. Each candidate includes:
 
 - A deep-dive shortlist that narrows the top 10 down to 2-3 focus candidates
+- Business quality, valuation, and structural-risk scores based on SEC company facts when available
 - A `Data Confidence` rating based on SEC filing evidence and second-source price consistency
 - The setup summary
 - Why it made the list
@@ -97,6 +98,9 @@ After the first-stage top 10 is selected, a second-stage deep dive narrows the l
 - The stock shows at least early stabilization from its 5-day low
 - The risk is bounded enough to investigate, instead of being dominated by legal, delisting, fraud, or bankruptcy language
 - There are multiple company-specific headlines rather than only broad macro noise
+- Business quality is not weak, based on revenue growth, margin, free cash flow, and balance-sheet leverage
+- Valuation has some support, based on SEC-derived P/S, P/E, and FCF yield approximations
+- Structural risk is not high enough to block a focus designation
 
 The report also assigns `Data Confidence`:
 

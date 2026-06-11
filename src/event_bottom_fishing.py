@@ -29,6 +29,7 @@ DEFAULT_ALIASES = os.path.join(ROOT, "config", "company_aliases.json")
 OUTPUT_DIR = os.path.join(ROOT, "outputs")
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 SEC_USER_AGENT = "auto-trading-research/0.1 lvyongyu@gmail.com"
 
 EVENT_KEYWORDS = {
@@ -116,6 +117,17 @@ class DataConfidence:
 
 
 @dataclasses.dataclass
+class FundamentalScore:
+    business_quality_score: float = 0.0
+    valuation_score: float = 0.0
+    structural_risk_penalty: float = 0.0
+    reasons: list[str] = dataclasses.field(default_factory=list)
+    risks: list[str] = dataclasses.field(default_factory=list)
+    metrics: dict[str, float | None] = dataclasses.field(default_factory=dict)
+    source_status: str = "not checked"
+
+
+@dataclasses.dataclass
 class Candidate:
     ticker: str
     score: float
@@ -132,6 +144,7 @@ class Candidate:
     deep_dive_reasons: list[str] = dataclasses.field(default_factory=list)
     deep_dive_risks: list[str] = dataclasses.field(default_factory=list)
     data_confidence: DataConfidence = dataclasses.field(default_factory=DataConfidence)
+    fundamentals: FundamentalScore = dataclasses.field(default_factory=FundamentalScore)
 
 
 def fetch_url(url: str, timeout: int = 12) -> bytes:
@@ -385,6 +398,218 @@ def fetch_recent_sec_filings(ticker: str, cik_by_ticker: dict[str, str], lookbac
     return filings
 
 
+def fetch_sec_company_facts(ticker: str, cik_by_ticker: dict[str, str]) -> dict | None:
+    cik = cik_by_ticker.get(ticker.upper())
+    if not cik:
+        return None
+    return json.loads(fetch_sec_url(SEC_COMPANY_FACTS_URL.format(cik=cik)).decode("utf-8"))
+
+
+def fact_units(payload: dict, tag_names: list[str], unit: str = "USD") -> list[dict]:
+    facts = payload.get("facts", {})
+    for taxonomy in ("us-gaap", "dei"):
+        taxonomy_facts = facts.get(taxonomy, {})
+        for tag in tag_names:
+            units = taxonomy_facts.get(tag, {}).get("units", {})
+            if unit in units:
+                return units[unit]
+    return []
+
+
+def latest_annual_value(payload: dict, tag_names: list[str], unit: str = "USD") -> tuple[float | None, str | None]:
+    values = [
+        item for item in fact_units(payload, tag_names, unit)
+        if item.get("fy") and item.get("fp") == "FY" and isinstance(item.get("val"), (int, float))
+    ]
+    values.sort(key=lambda item: (item.get("fy", 0), item.get("filed", "")), reverse=True)
+    if not values:
+        return None, None
+    return float(values[0]["val"]), str(values[0].get("fy"))
+
+
+def latest_two_annual_values(payload: dict, tag_names: list[str], unit: str = "USD") -> list[tuple[int, float]]:
+    values_by_year: dict[int, float] = {}
+    values = [
+        item for item in fact_units(payload, tag_names, unit)
+        if item.get("fy") and item.get("fp") == "FY" and isinstance(item.get("val"), (int, float))
+    ]
+    values.sort(key=lambda item: (item.get("fy", 0), item.get("filed", "")), reverse=True)
+    for item in values:
+        year = int(item["fy"])
+        values_by_year.setdefault(year, float(item["val"]))
+        if len(values_by_year) >= 2:
+            break
+    return sorted(values_by_year.items(), reverse=True)
+
+
+def latest_value(payload: dict, tag_names: list[str], unit: str) -> float | None:
+    values = [
+        item for item in fact_units(payload, tag_names, unit)
+        if isinstance(item.get("val"), (int, float))
+    ]
+    values.sort(key=lambda item: item.get("filed", ""), reverse=True)
+    return float(values[0]["val"]) if values else None
+
+
+def pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value * 100:.1f}%"
+
+
+def multiple(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}x"
+
+
+def score_fundamentals(candidate: Candidate, facts: dict | None) -> FundamentalScore:
+    if not facts:
+        return FundamentalScore(source_status="SEC company facts unavailable")
+
+    revenue_values = latest_two_annual_values(
+        facts,
+        ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"],
+    )
+    latest_revenue = revenue_values[0][1] if revenue_values else None
+    prior_revenue = revenue_values[1][1] if len(revenue_values) > 1 else None
+    revenue_growth = (
+        latest_revenue / prior_revenue - 1
+        if latest_revenue and prior_revenue and prior_revenue > 0
+        else None
+    )
+    net_income, _ = latest_annual_value(facts, ["NetIncomeLoss"])
+    operating_cash_flow, _ = latest_annual_value(facts, ["NetCashProvidedByUsedInOperatingActivities"])
+    capex, _ = latest_annual_value(facts, ["PaymentsToAcquirePropertyPlantAndEquipment"])
+    assets, _ = latest_annual_value(facts, ["Assets"])
+    liabilities, _ = latest_annual_value(facts, ["Liabilities"])
+    shares = latest_value(facts, ["EntityCommonStockSharesOutstanding"], "shares")
+
+    fcf = (
+        operating_cash_flow - capex
+        if operating_cash_flow is not None and capex is not None
+        else None
+    )
+    net_margin = net_income / latest_revenue if net_income is not None and latest_revenue else None
+    fcf_margin = fcf / latest_revenue if fcf is not None and latest_revenue else None
+    liabilities_to_assets = liabilities / assets if liabilities is not None and assets else None
+    market_cap = candidate.price.last_close * shares if shares else None
+    price_to_sales = market_cap / latest_revenue if market_cap and latest_revenue else None
+    price_to_earnings = market_cap / net_income if market_cap and net_income and net_income > 0 else None
+    fcf_yield = fcf / market_cap if fcf is not None and market_cap else None
+
+    quality = 0.0
+    valuation = 0.0
+    structural_penalty = 0.0
+    reasons = []
+    risks = []
+
+    if revenue_growth is not None:
+        if revenue_growth > 0.08:
+            quality += 8
+            reasons.append(f"Revenue growth is healthy at {pct(revenue_growth)}.")
+        elif revenue_growth >= 0:
+            quality += 4
+            reasons.append(f"Revenue is still growing, but modestly at {pct(revenue_growth)}.")
+        else:
+            structural_penalty += 8
+            risks.append(f"Revenue declined {pct(abs(revenue_growth))}, suggesting more than a simple event dip.")
+    else:
+        risks.append("Revenue growth could not be calculated from SEC company facts.")
+
+    if net_margin is not None:
+        if net_margin > 0.15:
+            quality += 8
+            reasons.append(f"Net margin is strong at {pct(net_margin)}.")
+        elif net_margin > 0.05:
+            quality += 4
+            reasons.append(f"Net margin is positive at {pct(net_margin)}.")
+        elif net_margin < 0:
+            structural_penalty += 8
+            risks.append("Latest annual net income is negative.")
+    if fcf_margin is not None:
+        if fcf_margin > 0.08:
+            quality += 8
+            reasons.append(f"Free-cash-flow margin is healthy at {pct(fcf_margin)}.")
+        elif fcf_margin > 0:
+            quality += 4
+            reasons.append(f"Free cash flow is positive, with FCF margin at {pct(fcf_margin)}.")
+        else:
+            structural_penalty += 8
+            risks.append("Free cash flow is negative on the latest annual SEC data.")
+    if liabilities_to_assets is not None:
+        if liabilities_to_assets < 0.55:
+            quality += 6
+            reasons.append(f"Balance-sheet leverage looks manageable with liabilities/assets at {pct(liabilities_to_assets)}.")
+        elif liabilities_to_assets > 0.8:
+            structural_penalty += 8
+            risks.append(f"Liabilities/assets is high at {pct(liabilities_to_assets)}.")
+
+    if price_to_sales is not None:
+        if price_to_sales < 2:
+            valuation += 8
+            reasons.append(f"Price/sales looks reasonable at {multiple(price_to_sales)}.")
+        elif price_to_sales < 5:
+            valuation += 4
+            reasons.append(f"Price/sales is not extreme at {multiple(price_to_sales)}.")
+        elif price_to_sales > 8:
+            structural_penalty += 5
+            risks.append(f"Price/sales remains rich at {multiple(price_to_sales)} despite the selloff.")
+    if price_to_earnings is not None:
+        if price_to_earnings < 18:
+            valuation += 8
+            reasons.append(f"Trailing P/E is reasonable at {multiple(price_to_earnings)}.")
+        elif price_to_earnings < 30:
+            valuation += 4
+            reasons.append(f"Trailing P/E is acceptable but not cheap at {multiple(price_to_earnings)}.")
+        elif price_to_earnings > 45:
+            structural_penalty += 4
+            risks.append(f"Trailing P/E remains elevated at {multiple(price_to_earnings)}.")
+    if fcf_yield is not None:
+        if fcf_yield > 0.05:
+            valuation += 9
+            reasons.append(f"FCF yield is attractive at {pct(fcf_yield)}.")
+        elif fcf_yield > 0.025:
+            valuation += 5
+            reasons.append(f"FCF yield is positive at {pct(fcf_yield)}.")
+        elif fcf_yield < 0:
+            structural_penalty += 6
+            risks.append("FCF yield is negative.")
+
+    structural_words = (
+        "turnaround", "slower-than-expected", "debt", "cost cuts", "layoffs",
+        "market share", "trust", "probe", "investigation", "lawsuit", "regulatory",
+        "weak sales", "lack of catalysts", "guidance cut",
+    )
+    structural_hits = [
+        event.title for event in candidate.events
+        if any(word in event.title.lower() for word in structural_words)
+    ]
+    if structural_hits:
+        penalty = min(len(structural_hits) * 4, 12)
+        structural_penalty += penalty
+        risks.append(f"{len(structural_hits)} headline(s) contain structural-risk language.")
+
+    metrics = {
+        "revenue_growth": revenue_growth,
+        "net_margin": net_margin,
+        "fcf_margin": fcf_margin,
+        "liabilities_to_assets": liabilities_to_assets,
+        "price_to_sales": price_to_sales,
+        "price_to_earnings": price_to_earnings,
+        "fcf_yield": fcf_yield,
+    }
+    if not reasons:
+        reasons.append("SEC company facts were available, but no strong quality or valuation support was found.")
+    if not risks:
+        risks.append("No major structural warning was detected from the available SEC facts and event headlines.")
+    return FundamentalScore(
+        business_quality_score=round(min(quality, 30), 2),
+        valuation_score=round(min(valuation, 25), 2),
+        structural_risk_penalty=round(min(structural_penalty, 45), 2),
+        reasons=reasons,
+        risks=risks,
+        metrics=metrics,
+        source_status="SEC company facts",
+    )
+
+
 def add_score(breakdown: dict[str, float], label: str, value: float) -> None:
     breakdown[label] = round(breakdown.get(label, 0.0) + value, 2)
 
@@ -541,6 +766,22 @@ def score_deep_dive(candidate: Candidate) -> tuple[float, list[str], list[str]]:
         score -= 6
         risks.append("Only one company-specific headline passed the filter, so the evidence base is thin.")
 
+    score += candidate.fundamentals.business_quality_score
+    score += candidate.fundamentals.valuation_score
+    score -= candidate.fundamentals.structural_risk_penalty
+    if candidate.fundamentals.business_quality_score:
+        reasons.append(
+            f"Business quality adds {candidate.fundamentals.business_quality_score:.1f} points based on SEC company facts."
+        )
+    if candidate.fundamentals.valuation_score:
+        reasons.append(
+            f"Valuation adds {candidate.fundamentals.valuation_score:.1f} points based on SEC-derived multiples."
+        )
+    if candidate.fundamentals.structural_risk_penalty:
+        risks.append(
+            f"Structural risk subtracts {candidate.fundamentals.structural_risk_penalty:.1f} points."
+        )
+
     if not reasons:
         reasons.append("It remains on the research list, but the deep-dive layer did not find a strong reason to prioritize it.")
     if not risks:
@@ -614,12 +855,13 @@ def build_data_confidence(
     )
 
 
-def apply_data_confidence(candidates: list[Candidate], lookback_days: int, sleep_seconds: float) -> list[Candidate]:
-    try:
-        cik_by_ticker = load_sec_ticker_map()
-    except Exception:
-        cik_by_ticker = {}
-
+def apply_data_confidence(
+    candidates: list[Candidate],
+    lookback_days: int,
+    sleep_seconds: float,
+    cik_by_ticker: dict[str, str] | None = None,
+) -> list[Candidate]:
+    cik_by_ticker = cik_by_ticker or load_sec_ticker_map_safely()
     for candidate in candidates:
         sec_filings: list[FilingItem] = []
         secondary_price: PriceStats | None = None
@@ -637,6 +879,13 @@ def apply_data_confidence(candidates: list[Candidate], lookback_days: int, sleep
     return candidates
 
 
+def load_sec_ticker_map_safely() -> dict[str, str]:
+    try:
+        return load_sec_ticker_map()
+    except Exception:
+        return {}
+
+
 def apply_deep_dive(candidates: list[Candidate], focus_count: int) -> list[Candidate]:
     for candidate in candidates:
         score, reasons, risks = score_deep_dive(candidate)
@@ -645,14 +894,64 @@ def apply_deep_dive(candidates: list[Candidate], focus_count: int) -> list[Candi
         candidate.deep_dive_risks = risks
 
     ranked = sorted(candidates, key=lambda item: item.deep_dive_score, reverse=True)
-    focus_tickers = {candidate.ticker for candidate in ranked[:focus_count] if candidate.deep_dive_score > 0}
+    focus_eligible = [
+        candidate for candidate in ranked
+        if (
+            candidate.deep_dive_score > 0
+            and candidate.fundamentals.structural_risk_penalty <= 25
+            and candidate.fundamentals.business_quality_score >= 8
+            and (
+                candidate.fundamentals.valuation_score >= 8
+                or candidate.fundamentals.business_quality_score >= 18
+            )
+        )
+    ]
+    focus_tickers = {candidate.ticker for candidate in focus_eligible[:focus_count]}
     for candidate in candidates:
         if candidate.ticker in focus_tickers:
             candidate.deep_dive_decision = "Focus"
+        elif candidate.fundamentals.structural_risk_penalty > 30:
+            candidate.deep_dive_decision = "Pass"
         elif candidate.deep_dive_score >= 35:
             candidate.deep_dive_decision = "Watch"
         else:
             candidate.deep_dive_decision = "Pass"
+    return candidates
+
+
+def prepare_selected_candidates(
+    candidates: list[Candidate],
+    args: argparse.Namespace,
+) -> list[Candidate]:
+    selected = candidates[: args.top] if args.include_avoid else select_investable_candidates(candidates, args.top)
+    cik_by_ticker = load_sec_ticker_map_safely()
+    selected = apply_fundamental_scores(selected, cik_by_ticker, args.sleep)
+    selected = apply_deep_dive(selected, args.deep_dive_focus)
+    if not args.skip_data_confidence:
+        selected = apply_data_confidence(selected, args.lookback_days, args.sleep, cik_by_ticker)
+    return selected
+
+
+def select_investable_candidates(candidates: list[Candidate], top: int) -> list[Candidate]:
+    investable = [candidate for candidate in candidates if candidate.bucket != "D"]
+    if len(investable) >= top:
+        return investable[:top]
+    avoid = [candidate for candidate in candidates if candidate.bucket == "D"]
+    return (investable + avoid)[:top]
+
+
+def apply_fundamental_scores(
+    candidates: list[Candidate],
+    cik_by_ticker: dict[str, str],
+    sleep_seconds: float,
+) -> list[Candidate]:
+    for candidate in candidates:
+        try:
+            facts = fetch_sec_company_facts(candidate.ticker, cik_by_ticker)
+            candidate.fundamentals = score_fundamentals(candidate, facts)
+            time.sleep(sleep_seconds)
+        except Exception:
+            candidate.fundamentals = FundamentalScore(source_status="SEC company facts unavailable")
     return candidates
 
 
@@ -782,6 +1081,15 @@ def candidate_to_dict(candidate: Candidate) -> dict:
                 for filing in candidate.data_confidence.sec_filings
             ],
         },
+        "fundamentals": {
+            "business_quality_score": candidate.fundamentals.business_quality_score,
+            "valuation_score": candidate.fundamentals.valuation_score,
+            "structural_risk_penalty": candidate.fundamentals.structural_risk_penalty,
+            "reasons": candidate.fundamentals.reasons,
+            "risks": candidate.fundamentals.risks,
+            "metrics": candidate.fundamentals.metrics,
+            "source_status": candidate.fundamentals.source_status,
+        },
         "price": dataclasses.asdict(candidate.price),
         "events": [
             {
@@ -820,8 +1128,8 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
         handle.write("## Deep Dive Shortlist\n\n")
         if focus_candidates:
             handle.write("These are the 2-3 candidates the second-stage review thinks are most worth serious manual research this week.\n\n")
-            handle.write("| Rank | Ticker | Deep Dive Score | Data Confidence | Original Score | Why It Is A Focus Candidate | Main Risk |\n")
-            handle.write("| ---: | --- | ---: | --- | ---: | --- | --- |\n")
+            handle.write("| Rank | Ticker | Deep Dive | Quality | Valuation | Structural Risk | Confidence | Original Score | Why It Is A Focus Candidate | Main Risk |\n")
+            handle.write("| ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | --- | --- |\n")
             for index, candidate in enumerate(
                 sorted(focus_candidates, key=lambda item: item.deep_dive_score, reverse=True),
                 start=1,
@@ -830,6 +1138,9 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
                 risk = candidate.deep_dive_risks[0] if candidate.deep_dive_risks else ""
                 handle.write(
                     f"| {index} | {candidate.ticker} | {candidate.deep_dive_score:.2f} | "
+                    f"{candidate.fundamentals.business_quality_score:.2f} | "
+                    f"{candidate.fundamentals.valuation_score:.2f} | "
+                    f"{candidate.fundamentals.structural_risk_penalty:.2f} | "
                     f"{candidate.data_confidence.level} | {candidate.score:.2f} | "
                     f"{markdown_escape(reason)} | {markdown_escape(risk)} |\n"
                 )
@@ -837,8 +1148,8 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
             handle.write("No candidates passed the deep-dive focus threshold this week.\n")
 
         handle.write("\n## Full Top-10 Event Screen\n\n")
-        handle.write("| Rank | Ticker | Decision | Confidence | Bucket | Score | Deep Dive | Setup | Why It Made The List | Key Risk |\n")
-        handle.write("| ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- |\n")
+        handle.write("| Rank | Ticker | Decision | Confidence | Bucket | Score | Deep Dive | Quality | Valuation | Structural Risk | Setup | Why It Made The List | Key Risk |\n")
+        handle.write("| ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |\n")
         for index, candidate in enumerate(candidates, start=1):
             risk = candidate.risks[0] if candidate.risks else ""
             reason = candidate.reasons[0] if candidate.reasons else ""
@@ -846,6 +1157,9 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
                 f"| {index} | {candidate.ticker} | {candidate.deep_dive_decision} | "
                 f"{candidate.data_confidence.level} | {candidate.bucket} | "
                 f"{candidate.score:.2f} | {candidate.deep_dive_score:.2f} | "
+                f"{candidate.fundamentals.business_quality_score:.2f} | "
+                f"{candidate.fundamentals.valuation_score:.2f} | "
+                f"{candidate.fundamentals.structural_risk_penalty:.2f} | "
                 f"{markdown_escape(candidate.thesis)} | "
                 f"{markdown_escape(reason)} | {markdown_escape(risk)} |\n"
             )
@@ -856,8 +1170,31 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
             handle.write(f"**Deep Dive Score:** {candidate.deep_dive_score:.2f}  \n")
             handle.write(f"**Deep Dive Decision:** {candidate.deep_dive_decision}  \n")
             handle.write(f"**Data Confidence:** {candidate.data_confidence.level}  \n")
+            handle.write(f"**Business Quality Score:** {candidate.fundamentals.business_quality_score:.2f}  \n")
+            handle.write(f"**Valuation Score:** {candidate.fundamentals.valuation_score:.2f}  \n")
+            handle.write(f"**Structural Risk Penalty:** {candidate.fundamentals.structural_risk_penalty:.2f}  \n")
             handle.write(f"**Bucket:** {candidate.bucket}  \n")
             handle.write(f"**Setup:** {candidate.thesis}\n\n")
+
+            handle.write("**Business quality, valuation, and structural risk**\n\n")
+            handle.write(f"- Source: {candidate.fundamentals.source_status}\n")
+            for reason in candidate.fundamentals.reasons:
+                handle.write(f"- {reason}\n")
+            for risk in candidate.fundamentals.risks:
+                handle.write(f"- {risk}\n")
+            metrics = candidate.fundamentals.metrics
+            if metrics:
+                handle.write(
+                    "- Metrics: "
+                    f"revenue growth {pct(metrics.get('revenue_growth'))}, "
+                    f"net margin {pct(metrics.get('net_margin'))}, "
+                    f"FCF margin {pct(metrics.get('fcf_margin'))}, "
+                    f"liabilities/assets {pct(metrics.get('liabilities_to_assets'))}, "
+                    f"P/S {multiple(metrics.get('price_to_sales'))}, "
+                    f"P/E {multiple(metrics.get('price_to_earnings'))}, "
+                    f"FCF yield {pct(metrics.get('fcf_yield'))}\n"
+                )
+            handle.write("\n")
 
             handle.write("**Data confidence**\n\n")
             for reason in candidate.data_confidence.reasons:
@@ -940,17 +1277,7 @@ def scan(args: argparse.Namespace) -> list[Candidate]:
                 print(f"[{index}/{len(tickers)}] {ticker}: skipped ({exc})", file=sys.stderr, flush=True)
             continue
     candidates.sort(key=lambda item: item.score, reverse=True)
-    if args.include_avoid:
-        selected = apply_deep_dive(candidates[: args.top], args.deep_dive_focus)
-        return selected if args.skip_data_confidence else apply_data_confidence(selected, args.lookback_days, args.sleep)
-
-    investable = [candidate for candidate in candidates if candidate.bucket != "D"]
-    if len(investable) >= args.top:
-        selected = apply_deep_dive(investable[: args.top], args.deep_dive_focus)
-        return selected if args.skip_data_confidence else apply_data_confidence(selected, args.lookback_days, args.sleep)
-    avoid = [candidate for candidate in candidates if candidate.bucket == "D"]
-    selected = apply_deep_dive((investable + avoid)[: args.top], args.deep_dive_focus)
-    return selected if args.skip_data_confidence else apply_data_confidence(selected, args.lookback_days, args.sleep)
+    return prepare_selected_candidates(candidates, args)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
