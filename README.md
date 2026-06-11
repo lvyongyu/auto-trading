@@ -25,6 +25,7 @@ Outputs are written to `outputs/` as both Markdown and JSON.
 
 The Markdown report is designed for a human reader. Each candidate includes:
 
+- A deep-dive shortlist that narrows the top 10 down to 2-3 focus candidates
 - The setup summary
 - Why it made the list
 - What could break the thesis
@@ -79,12 +80,20 @@ For company-name matching, edit `config/company_aliases.json`.
 
 ## Ranking Idea
 
-The score favors stocks that:
+The first-stage score favors stocks that:
 
 - Have meaningful negative or mixed events recently
 - Dropped enough to be interesting
 - Show early stabilization rather than continued free-fall
 - Do not have obvious terminal-risk event language
+
+After the first-stage top 10 is selected, a second-stage deep dive narrows the list to 2-3 focus candidates. It favors stocks where:
+
+- The event is tied to something verifiable, such as earnings, guidance, revenue, margin, or analyst revisions
+- The drawdown is meaningful but not so extreme that it likely signals structural damage
+- The stock shows at least early stabilization from its 5-day low
+- The risk is bounded enough to investigate, instead of being dominated by legal, delisting, fraud, or bankruptcy language
+- There are multiple company-specific headlines rather than only broad macro noise
 
 The output classes are:
 

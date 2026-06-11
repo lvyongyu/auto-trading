@@ -106,6 +106,10 @@ class Candidate:
     score_breakdown: dict[str, float]
     events: list[NewsItem]
     price: PriceStats
+    deep_dive_score: float = 0.0
+    deep_dive_decision: str = "Review"
+    deep_dive_reasons: list[str] = dataclasses.field(default_factory=list)
+    deep_dive_risks: list[str] = dataclasses.field(default_factory=list)
 
 
 def fetch_url(url: str, timeout: int = 12) -> bytes:
@@ -268,6 +272,14 @@ def top_category_labels(category_counts: dict[str, int], limit: int = 3) -> list
     return [event_label(category) for category in categories]
 
 
+def count_categories(news: list[NewsItem]) -> dict[str, int]:
+    category_counts: dict[str, int] = {}
+    for item in news:
+        for category in item.categories:
+            category_counts[category] = category_counts.get(category, 0) + 1
+    return category_counts
+
+
 def build_reasons(
     news: list[NewsItem],
     category_counts: dict[str, int],
@@ -335,11 +347,93 @@ def build_watchpoints(category_counts: dict[str, int], price: PriceStats) -> lis
     return watchpoints
 
 
+def score_deep_dive(candidate: Candidate) -> tuple[float, list[str], list[str]]:
+    category_counts = count_categories(candidate.events)
+    reasons = []
+    risks = []
+    score = 0.0
+
+    if category_counts.get("earnings_recoverable"):
+        score += 18
+        reasons.append("The main event is tied to earnings, guidance, revenue, or margin, which can be checked against the next report.")
+    if category_counts.get("analyst_negative") and (
+        category_counts.get("analyst_positive") or category_counts.get("earnings_recoverable")
+    ):
+        score += 12
+        reasons.append("There is a negative catalyst, but it appears debatable rather than one-sided because offsetting events also appeared.")
+    if category_counts.get("analyst_positive") or category_counts.get("company_action_positive"):
+        score += 10
+        reasons.append("A constructive analyst or company-action signal appeared after the selloff.")
+    if -30 <= candidate.price.drawdown_60d <= -10:
+        score += 16
+        reasons.append("The drawdown is large enough to matter but not so extreme that the screen treats it as likely structural damage.")
+    elif candidate.price.drawdown_60d < -30:
+        score += 6
+        risks.append("The drawdown is very deep, so the market may be pricing in more than a temporary event.")
+    if candidate.price.change_20d < -5:
+        score += 8
+        reasons.append("The recent 20-day selloff gives the setup a clear event-driven repricing window.")
+    if candidate.price.above_5d_low >= 2:
+        score += 14
+        reasons.append("The stock has started to lift from its 5-day low, which is a first sign that selling pressure may be cooling.")
+    else:
+        risks.append("There is not enough short-term stabilization yet; it may still be too early.")
+    if candidate.price.change_5d < -10:
+        score -= 12
+        risks.append("The 5-day move is still sharply negative, so this can still be a falling-knife setup.")
+    if candidate.price.volume_ratio_5d_20d > 1.2:
+        score += 6
+        reasons.append("Volume expanded around the move, suggesting the market is actively repricing the event.")
+
+    legal = category_counts.get("legal_regulatory", 0)
+    terminal = category_counts.get("terminal_risk", 0)
+    if legal:
+        score -= legal * 12
+        risks.append("Legal or regulatory headlines make the downside harder to bound.")
+    if terminal:
+        score -= terminal * 40
+        risks.append("Terminal-risk language appeared; this should not be a focus candidate without primary-source confirmation.")
+
+    specific_events = [
+        event for event in candidate.events
+        if any(category != "macro_sector" for category in event.categories)
+    ]
+    if len(specific_events) >= 3:
+        score += 8
+        reasons.append("There are multiple company-specific headlines, so the setup is easier to audit than a broad macro move.")
+    elif len(specific_events) == 1:
+        score -= 6
+        risks.append("Only one company-specific headline passed the filter, so the evidence base is thin.")
+
+    if not reasons:
+        reasons.append("It remains on the research list, but the deep-dive layer did not find a strong reason to prioritize it.")
+    if not risks:
+        risks.append("The largest risk is headline interpretation; verify with primary filings or the latest earnings call.")
+
+    return round(score, 2), reasons, risks
+
+
+def apply_deep_dive(candidates: list[Candidate], focus_count: int) -> list[Candidate]:
+    for candidate in candidates:
+        score, reasons, risks = score_deep_dive(candidate)
+        candidate.deep_dive_score = score
+        candidate.deep_dive_reasons = reasons
+        candidate.deep_dive_risks = risks
+
+    ranked = sorted(candidates, key=lambda item: item.deep_dive_score, reverse=True)
+    focus_tickers = {candidate.ticker for candidate in ranked[:focus_count] if candidate.deep_dive_score > 0}
+    for candidate in candidates:
+        if candidate.ticker in focus_tickers:
+            candidate.deep_dive_decision = "Focus"
+        elif candidate.deep_dive_score >= 35:
+            candidate.deep_dive_decision = "Watch"
+        else:
+            candidate.deep_dive_decision = "Pass"
+    return candidates
+
+
 def score_candidate(ticker: str, news: list[NewsItem], price: PriceStats) -> Candidate:
-    category_counts: dict[str, int] = {}
-    for item in news:
-        for category in item.categories:
-            category_counts[category] = category_counts.get(category, 0) + 1
+    category_counts = count_categories(news)
 
     specific_events = [
         item for item in news
@@ -444,6 +538,12 @@ def candidate_to_dict(candidate: Candidate) -> dict:
         "risks": candidate.risks,
         "watchpoints": candidate.watchpoints,
         "score_breakdown": candidate.score_breakdown,
+        "deep_dive": {
+            "score": candidate.deep_dive_score,
+            "decision": candidate.deep_dive_decision,
+            "reasons": candidate.deep_dive_reasons,
+            "risks": candidate.deep_dive_risks,
+        },
         "price": dataclasses.asdict(candidate.price),
         "events": [
             {
@@ -477,22 +577,56 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
         handle.write("# Weekly Event-Only Bottom-Fishing Watchlist\n\n")
         handle.write(f"Generated: {payload['generated_at']}\n\n")
         handle.write("This is a research watchlist, not investment advice or an auto-trading signal.\n\n")
-        handle.write("| Rank | Ticker | Bucket | Score | Setup | Why It Made The List | Key Risk |\n")
-        handle.write("| ---: | --- | --- | ---: | --- | --- | --- |\n")
+
+        focus_candidates = [candidate for candidate in candidates if candidate.deep_dive_decision == "Focus"]
+        handle.write("## Deep Dive Shortlist\n\n")
+        if focus_candidates:
+            handle.write("These are the 2-3 candidates the second-stage review thinks are most worth serious manual research this week.\n\n")
+            handle.write("| Rank | Ticker | Deep Dive Score | Original Score | Why It Is A Focus Candidate | Main Risk |\n")
+            handle.write("| ---: | --- | ---: | ---: | --- | --- |\n")
+            for index, candidate in enumerate(
+                sorted(focus_candidates, key=lambda item: item.deep_dive_score, reverse=True),
+                start=1,
+            ):
+                reason = candidate.deep_dive_reasons[0] if candidate.deep_dive_reasons else ""
+                risk = candidate.deep_dive_risks[0] if candidate.deep_dive_risks else ""
+                handle.write(
+                    f"| {index} | {candidate.ticker} | {candidate.deep_dive_score:.2f} | "
+                    f"{candidate.score:.2f} | {markdown_escape(reason)} | {markdown_escape(risk)} |\n"
+                )
+        else:
+            handle.write("No candidates passed the deep-dive focus threshold this week.\n")
+
+        handle.write("\n## Full Top-10 Event Screen\n\n")
+        handle.write("| Rank | Ticker | Decision | Bucket | Score | Deep Dive | Setup | Why It Made The List | Key Risk |\n")
+        handle.write("| ---: | --- | --- | --- | ---: | ---: | --- | --- | --- |\n")
         for index, candidate in enumerate(candidates, start=1):
             risk = candidate.risks[0] if candidate.risks else ""
             reason = candidate.reasons[0] if candidate.reasons else ""
             handle.write(
-                f"| {index} | {candidate.ticker} | {candidate.bucket} | "
-                f"{candidate.score:.2f} | {markdown_escape(candidate.thesis)} | "
+                f"| {index} | {candidate.ticker} | {candidate.deep_dive_decision} | "
+                f"{candidate.bucket} | {candidate.score:.2f} | {candidate.deep_dive_score:.2f} | "
+                f"{markdown_escape(candidate.thesis)} | "
                 f"{markdown_escape(reason)} | {markdown_escape(risk)} |\n"
             )
         handle.write("\n## Candidate Rationale\n\n")
         for candidate in candidates:
             handle.write(f"### {candidate.ticker}\n\n")
             handle.write(f"**Score:** {candidate.score:.2f}  \n")
+            handle.write(f"**Deep Dive Score:** {candidate.deep_dive_score:.2f}  \n")
+            handle.write(f"**Deep Dive Decision:** {candidate.deep_dive_decision}  \n")
             handle.write(f"**Bucket:** {candidate.bucket}  \n")
             handle.write(f"**Setup:** {candidate.thesis}\n\n")
+
+            handle.write("**Deep dive take**\n\n")
+            for reason in candidate.deep_dive_reasons:
+                handle.write(f"- {reason}\n")
+            handle.write("\n")
+
+            handle.write("**Deep dive risks**\n\n")
+            for risk in candidate.deep_dive_risks:
+                handle.write(f"- {risk}\n")
+            handle.write("\n")
 
             handle.write("**Why it made the list**\n\n")
             for reason in candidate.reasons:
@@ -552,13 +686,13 @@ def scan(args: argparse.Namespace) -> list[Candidate]:
             continue
     candidates.sort(key=lambda item: item.score, reverse=True)
     if args.include_avoid:
-        return candidates[: args.top]
+        return apply_deep_dive(candidates[: args.top], args.deep_dive_focus)
 
     investable = [candidate for candidate in candidates if candidate.bucket != "D"]
     if len(investable) >= args.top:
-        return investable[: args.top]
+        return apply_deep_dive(investable[: args.top], args.deep_dive_focus)
     avoid = [candidate for candidate in candidates if candidate.bucket == "D"]
-    return (investable + avoid)[: args.top]
+    return apply_deep_dive((investable + avoid)[: args.top], args.deep_dive_focus)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -568,6 +702,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--lookback-days", type=int, default=14)
     parser.add_argument("--max-news", type=int, default=8)
+    parser.add_argument("--deep-dive-focus", type=int, default=3)
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--allow-broad-news", action="store_true")
     parser.add_argument("--include-avoid", action="store_true")

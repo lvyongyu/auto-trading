@@ -45,6 +45,7 @@ def generate_report(top: int, lookback_days: int, max_news: int) -> tuple[str, s
         top=top,
         lookback_days=lookback_days,
         max_news=max_news,
+        deep_dive_focus=3,
         sleep=0.15,
         allow_broad_news=False,
         include_avoid=False,
