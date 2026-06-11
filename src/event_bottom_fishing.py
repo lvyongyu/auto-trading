@@ -22,6 +22,15 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Iterable
 
+from llm_prompts import (
+    OPENAI_REVIEW_SYSTEM_PROMPT,
+    build_llm_review_prompt,
+    compact_text,
+    estimate_tokens,
+    multiple,
+    pct,
+)
+
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_UNIVERSE = os.path.join(ROOT, "config", "universe_sp100.txt")
@@ -152,11 +161,11 @@ class AgentResult:
 
 @dataclasses.dataclass
 class AgentReview:
-    action: str = "Watch"
-    trade_score: float = 0.0
+    decision: str = "Watch"
+    review_score: float = 0.0
     evidence_quality: float = 0.0
     risk_rating: str = "Medium"
-    thesis: str = ""
+    reasoning: str = ""
     main_bull_case: str = ""
     main_bear_case: str = ""
     missing_evidence: list[str] = dataclasses.field(default_factory=list)
@@ -491,14 +500,6 @@ def latest_value(payload: dict, tag_names: list[str], unit: str) -> float | None
     ]
     values.sort(key=lambda item: item.get("filed", ""), reverse=True)
     return float(values[0]["val"]) if values else None
-
-
-def pct(value: float | None) -> str:
-    return "n/a" if value is None else f"{value * 100:.1f}%"
-
-
-def multiple(value: float | None) -> str:
-    return "n/a" if value is None else f"{value:.1f}x"
 
 
 def score_fundamentals(candidate: Candidate, facts: dict | None) -> FundamentalScore:
@@ -965,17 +966,6 @@ def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
 
-def compact_text(value: str, max_chars: int) -> str:
-    value = re.sub(r"\s+", " ", value).strip()
-    if len(value) <= max_chars:
-        return value
-    return value[: max_chars - 3].rstrip() + "..."
-
-
-def estimate_tokens(value: str) -> int:
-    return max(1, len(value) // 4)
-
-
 def evidence_quality(candidate: Candidate) -> tuple[float, list[str]]:
     category_counts = count_categories(candidate.events)
     specific_events = [
@@ -1312,11 +1302,11 @@ def build_agent_review(candidate: Candidate, token_budget: int, provider: str = 
     ]
     debate_result = build_debate_result(candidate, specialist_results)
     risk_result = build_risk_result(candidate, evidence_score, specialist_results + [debate_result])
-    action, action_reason = decide_agent_action(candidate, evidence_score, risk_result)
-    trade_score = (
+    decision, decision_reason = decide_agent_action(candidate, evidence_score, risk_result)
+    review_score = (
         candidate.deep_dive_score
         + evidence_score * 20
-        - (20 if action == "Blocked" else 0)
+        - (20 if decision == "Blocked" else 0)
         - (10 if risk_result.stance == "negative" else 0)
     )
     missing_evidence = sorted({
@@ -1331,8 +1321,8 @@ def build_agent_review(candidate: Candidate, token_budget: int, provider: str = 
     if evidence_score < 0.55:
         invalidation.append("Primary-source evidence remains unavailable.")
 
-    prompt = build_llm_prompt(candidate, specialist_results + [debate_result, risk_result], token_budget)
-    if action == "Blocked":
+    prompt = build_llm_review_prompt(candidate, specialist_results + [debate_result, risk_result], token_budget)
+    if decision == "Blocked":
         risk_rating = "Blocked"
     elif risk_result.stance == "negative":
         risk_rating = "High"
@@ -1342,11 +1332,11 @@ def build_agent_review(candidate: Candidate, token_budget: int, provider: str = 
         risk_rating = "Medium"
 
     review = AgentReview(
-        action=action,
-        trade_score=round(trade_score, 2),
+        decision=decision,
+        review_score=round(review_score, 2),
         evidence_quality=evidence_score,
         risk_rating=risk_rating,
-        thesis=action_reason,
+        reasoning=decision_reason,
         main_bull_case=candidate.deep_dive_reasons[0] if candidate.deep_dive_reasons else candidate.thesis,
         main_bear_case=candidate.deep_dive_risks[0] if candidate.deep_dive_risks else candidate.risks[0],
         missing_evidence=missing_evidence,
@@ -1360,53 +1350,6 @@ def build_agent_review(candidate: Candidate, token_budget: int, provider: str = 
     return review
 
 
-def build_llm_prompt(candidate: Candidate, agent_results: list[AgentResult], token_budget: int) -> str:
-    """Build a compact prompt for optional LLM review.
-
-    The prompt intentionally uses summaries, top evidence, and capped lists. Raw
-    article text, full SEC filings, and long metric payloads should stay out of
-    the prompt unless a future tool explicitly retrieves a targeted excerpt.
-    """
-    max_chars = max(1200, token_budget * 4)
-    metrics = candidate.fundamentals.metrics
-    event_lines = []
-    for event in candidate.events[:3]:
-        date = event.published.date().isoformat() if event.published else "unknown"
-        event_lines.append(f"- {date}: {compact_text(event.title, 160)}")
-    filing_lines = [
-        f"- {filing.filing_date}: {filing.form} {compact_text(filing.description, 120)}"
-        for filing in candidate.data_confidence.sec_filings[:3]
-    ]
-    agent_lines = [
-        f"- {result.agent}: {compact_text(result.conclusion, 220)}"
-        for result in agent_results
-    ]
-    prompt = f"""
-You are reviewing one stock candidate for a research watchlist, not giving investment advice.
-Return JSON only with action, main_bull_case, main_bear_case, missing_evidence, and risk_notes.
-
-Ticker: {candidate.ticker}
-Initial setup: {compact_text(candidate.thesis, 240)}
-Deep dive score: {candidate.deep_dive_score:.2f}
-Deep dive decision: {candidate.deep_dive_decision}
-Data confidence: {candidate.data_confidence.level}
-Quality score: {candidate.fundamentals.business_quality_score:.1f}
-Valuation score: {candidate.fundamentals.valuation_score:.1f}
-Structural risk penalty: {candidate.fundamentals.structural_risk_penalty:.1f}
-Metrics: revenue_growth={pct(metrics.get('revenue_growth'))}, net_margin={pct(metrics.get('net_margin'))}, fcf_margin={pct(metrics.get('fcf_margin'))}, liabilities/assets={pct(metrics.get('liabilities_to_assets'))}, P/S={multiple(metrics.get('price_to_sales'))}, P/E={multiple(metrics.get('price_to_earnings'))}, FCF_yield={pct(metrics.get('fcf_yield'))}
-
-Recent events:
-{chr(10).join(event_lines) if event_lines else "- none"}
-
-Recent SEC filings:
-{chr(10).join(filing_lines) if filing_lines else "- none found in lookback"}
-
-Agent summaries:
-{chr(10).join(agent_lines)}
-""".strip()
-    return compact_text(prompt, max_chars)
-
-
 def call_openai_review(prompt: str, model: str, max_output_tokens: int) -> dict | None:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -1416,10 +1359,7 @@ def call_openai_review(prompt: str, model: str, max_output_tokens: int) -> dict 
         "input": [
             {
                 "role": "system",
-                "content": (
-                    "You are a cautious equity research assistant. "
-                    "Return compact JSON only. Do not provide investment advice."
-                ),
+                "content": OPENAI_REVIEW_SYSTEM_PROMPT,
             },
             {"role": "user", "content": prompt},
         ],
@@ -1463,11 +1403,11 @@ def apply_llm_overlay(
         return
     reviewable = sorted(
         candidates,
-        key=lambda item: item.agent_review.trade_score,
+        key=lambda item: item.agent_review.review_score,
         reverse=True,
     )[:review_count]
     for candidate in reviewable:
-        prompt = build_llm_prompt(candidate, candidate.agent_review.agent_results, token_budget)
+        prompt = build_llm_review_prompt(candidate, candidate.agent_review.agent_results, token_budget)
         try:
             result = call_openai_review(prompt, model, max_output_tokens)
         except Exception as exc:  # noqa: BLE001 - LLM should never break the report.
@@ -1479,9 +1419,9 @@ def apply_llm_overlay(
         candidate.agent_review.llm_provider = "openai"
         candidate.agent_review.llm_notes = compact_text(json.dumps(result, ensure_ascii=False), 800)
         if isinstance(result, dict):
-            action = str(result.get("action") or "").strip()
-            if action in {"Focus", "Watch", "Pass", "Blocked"}:
-                candidate.agent_review.action = action
+            decision = str(result.get("decision") or result.get("action") or "").strip()
+            if decision in {"Focus", "Watch", "Pass", "Blocked"}:
+                candidate.agent_review.decision = decision
             if result.get("main_bull_case"):
                 candidate.agent_review.main_bull_case = compact_text(str(result["main_bull_case"]), 500)
             if result.get("main_bear_case"):
@@ -1684,11 +1624,11 @@ def candidate_to_dict(candidate: Candidate) -> dict:
             "source_status": candidate.fundamentals.source_status,
         },
         "agent_review": {
-            "action": candidate.agent_review.action,
-            "trade_score": candidate.agent_review.trade_score,
+            "decision": candidate.agent_review.decision,
+            "review_score": candidate.agent_review.review_score,
             "evidence_quality": candidate.agent_review.evidence_quality,
             "risk_rating": candidate.agent_review.risk_rating,
-            "thesis": candidate.agent_review.thesis,
+            "reasoning": candidate.agent_review.reasoning,
             "main_bull_case": candidate.agent_review.main_bull_case,
             "main_bear_case": candidate.agent_review.main_bear_case,
             "missing_evidence": candidate.agent_review.missing_evidence,
@@ -1747,19 +1687,19 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
         handle.write(f"Generated: {payload['generated_at']}\n\n")
         handle.write("This is a research watchlist, not investment advice or an auto-trading signal.\n\n")
 
-        focus_candidates = [candidate for candidate in candidates if candidate.agent_review.action == "Focus"]
+        focus_candidates = [candidate for candidate in candidates if candidate.agent_review.decision == "Focus"]
         handle.write("## AI Agent Review Shortlist\n\n")
         if focus_candidates:
             handle.write("These are the 2-3 candidates the agent review thinks are most worth serious manual research today.\n\n")
-            handle.write("| Rank | Ticker | Action | Agent Score | Evidence Quality | Risk | Token Est. | Main Bull Case | Main Bear Case |\n")
+            handle.write("| Rank | Ticker | Decision | Review Score | Evidence Quality | Risk | Token Est. | Main Bull Case | Main Bear Case |\n")
             handle.write("| ---: | --- | --- | ---: | ---: | --- | ---: | --- | --- |\n")
             for index, candidate in enumerate(
-                sorted(focus_candidates, key=lambda item: item.agent_review.trade_score, reverse=True),
+                sorted(focus_candidates, key=lambda item: item.agent_review.review_score, reverse=True),
                 start=1,
             ):
                 handle.write(
-                    f"| {index} | {candidate.ticker} | {candidate.agent_review.action} | "
-                    f"{candidate.agent_review.trade_score:.2f} | "
+                    f"| {index} | {candidate.ticker} | {candidate.agent_review.decision} | "
+                    f"{candidate.agent_review.review_score:.2f} | "
                     f"{candidate.agent_review.evidence_quality:.2f} | "
                     f"{candidate.agent_review.risk_rating} | "
                     f"{candidate.agent_review.prompt_tokens_estimate} | "
@@ -1793,13 +1733,13 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
             handle.write("No candidates passed the deterministic deep-dive focus threshold today.\n")
 
         handle.write("\n## Full Top-10 Event Screen\n\n")
-        handle.write("| Rank | Ticker | Agent Action | Evidence Quality | Agent Risk | Deep Dive | Confidence | Bucket | Score | Quality | Valuation | Structural Risk | Setup | Why It Made The List | Key Risk |\n")
+        handle.write("| Rank | Ticker | Agent Decision | Evidence Quality | Agent Risk | Deep Dive | Confidence | Bucket | Score | Quality | Valuation | Structural Risk | Setup | Why It Made The List | Key Risk |\n")
         handle.write("| ---: | --- | --- | ---: | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |\n")
         for index, candidate in enumerate(candidates, start=1):
             risk = candidate.risks[0] if candidate.risks else ""
             reason = candidate.reasons[0] if candidate.reasons else ""
             handle.write(
-                f"| {index} | {candidate.ticker} | {candidate.agent_review.action} | "
+                f"| {index} | {candidate.ticker} | {candidate.agent_review.decision} | "
                 f"{candidate.agent_review.evidence_quality:.2f} | {candidate.agent_review.risk_rating} | "
                 f"{candidate.deep_dive_score:.2f} | {candidate.data_confidence.level} | {candidate.bucket} | "
                 f"{candidate.score:.2f} | "
@@ -1815,8 +1755,8 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
             handle.write(f"**Score:** {candidate.score:.2f}  \n")
             handle.write(f"**Deep Dive Score:** {candidate.deep_dive_score:.2f}  \n")
             handle.write(f"**Deep Dive Decision:** {candidate.deep_dive_decision}  \n")
-            handle.write(f"**Agent Action:** {candidate.agent_review.action}  \n")
-            handle.write(f"**Agent Trade Score:** {candidate.agent_review.trade_score:.2f}  \n")
+            handle.write(f"**Agent Decision:** {candidate.agent_review.decision}  \n")
+            handle.write(f"**Agent Review Score:** {candidate.agent_review.review_score:.2f}  \n")
             handle.write(f"**Evidence Quality:** {candidate.agent_review.evidence_quality:.2f}  \n")
             handle.write(f"**Agent Risk:** {candidate.agent_review.risk_rating}  \n")
             handle.write(f"**Prompt Token Estimate:** {candidate.agent_review.prompt_tokens_estimate} / {candidate.agent_review.token_budget}  \n")
@@ -1829,8 +1769,8 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
             handle.write(f"**Setup:** {candidate.thesis}\n\n")
 
             handle.write("**AI agent review**\n\n")
-            handle.write(f"- Action: {candidate.agent_review.action}\n")
-            handle.write(f"- Thesis: {candidate.agent_review.thesis}\n")
+            handle.write(f"- Decision: {candidate.agent_review.decision}\n")
+            handle.write(f"- Reasoning: {candidate.agent_review.reasoning}\n")
             handle.write(f"- Main bull case: {candidate.agent_review.main_bull_case}\n")
             handle.write(f"- Main bear case: {candidate.agent_review.main_bear_case}\n")
             if candidate.agent_review.llm_notes:
