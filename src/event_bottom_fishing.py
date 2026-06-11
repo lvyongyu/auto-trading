@@ -13,7 +13,6 @@ import datetime as dt
 import email.utils
 import html
 import json
-import math
 import os
 import re
 import sys
@@ -101,7 +100,10 @@ class Candidate:
     score: float
     bucket: str
     thesis: str
+    reasons: list[str]
     risks: list[str]
+    watchpoints: list[str]
+    score_breakdown: dict[str, float]
     events: list[NewsItem]
     price: PriceStats
 
@@ -243,6 +245,96 @@ def fetch_price_stats(ticker: str) -> PriceStats | None:
     )
 
 
+def add_score(breakdown: dict[str, float], label: str, value: float) -> None:
+    breakdown[label] = round(breakdown.get(label, 0.0) + value, 2)
+
+
+def event_label(category: str) -> str:
+    labels = {
+        "earnings_miss": "earnings disappointment",
+        "earnings_recoverable": "earnings or guidance event",
+        "analyst_negative": "negative analyst action",
+        "analyst_positive": "positive analyst action",
+        "company_action_positive": "shareholder-friendly company action",
+        "legal_regulatory": "legal or regulatory event",
+        "terminal_risk": "terminal-risk event",
+        "macro_sector": "macro or sector event",
+    }
+    return labels.get(category, category.replace("_", " "))
+
+
+def top_category_labels(category_counts: dict[str, int], limit: int = 3) -> list[str]:
+    categories = sorted(category_counts, key=category_counts.get, reverse=True)[:limit]
+    return [event_label(category) for category in categories]
+
+
+def build_reasons(
+    news: list[NewsItem],
+    category_counts: dict[str, int],
+    price: PriceStats,
+    negative_event_count: int,
+    positive_event_count: int,
+) -> list[str]:
+    reasons = []
+    if price.drawdown_60d < -8:
+        reasons.append(
+            f"Price is {abs(price.drawdown_60d):.1f}% below its 60-day closing high, "
+            "so the setup is actually a pullback rather than a momentum chase."
+        )
+    if price.change_20d < -5:
+        reasons.append(
+            f"The stock is down {abs(price.change_20d):.1f}% over the last 20 trading days, "
+            "which gives the event enough price damage to review for a rebound setup."
+        )
+    if price.above_5d_low > 2:
+        reasons.append(
+            f"It has bounced {price.above_5d_low:.1f}% from its 5-day low, "
+            "a small sign that selling pressure may be slowing."
+        )
+    if price.volume_ratio_5d_20d > 1.2:
+        reasons.append(
+            f"Recent volume is {price.volume_ratio_5d_20d:.1f}x the 20-day average, "
+            "so the move is tied to active repricing rather than quiet drift."
+        )
+    if negative_event_count:
+        reasons.append(
+            f"{negative_event_count} company-specific negative event headline(s) created the selloff/catalyst to investigate."
+        )
+    if positive_event_count:
+        reasons.append(
+            f"{positive_event_count} positive or offsetting headline(s) suggest the story is not one-sided."
+        )
+    if category_counts.get("earnings_recoverable"):
+        reasons.append("The event mix includes earnings, guidance, margin, or revenue language, which can be checked in the next report.")
+    if category_counts.get("analyst_positive"):
+        reasons.append("At least one analyst-positive event appeared after the pullback, which can support a watchlist case.")
+    if category_counts.get("company_action_positive"):
+        reasons.append("Company action such as buybacks, dividends, asset sales, or activism may provide a catalyst.")
+
+    if not reasons:
+        reasons.append("It ranked mainly because recent event activity and price damage passed the basic screen.")
+    return reasons
+
+
+def build_watchpoints(category_counts: dict[str, int], price: PriceStats) -> list[str]:
+    watchpoints = []
+    if category_counts.get("earnings_miss") or category_counts.get("earnings_recoverable"):
+        watchpoints.append("Read the latest earnings release or call transcript; confirm whether guidance weakness is temporary or structural.")
+    if category_counts.get("analyst_negative"):
+        watchpoints.append("Check whether downgrades are based on short-term valuation/catalysts or a deeper business deterioration.")
+    if category_counts.get("legal_regulatory"):
+        watchpoints.append("Do not treat this as a normal dip until the legal or regulatory downside is bounded.")
+    if category_counts.get("terminal_risk"):
+        watchpoints.append("Avoid unless primary filings prove terminal-risk language is not material.")
+    if price.change_5d < -10:
+        watchpoints.append("Wait for selling pressure to stabilize; the 5-day move is still sharply negative.")
+    if price.above_5d_low > 2:
+        watchpoints.append("Use the recent 5-day low as the first invalidation level for the rebound thesis.")
+    else:
+        watchpoints.append("Look for a close back above the event-day midpoint before treating it as stabilizing.")
+    return watchpoints
+
+
 def score_candidate(ticker: str, news: list[NewsItem], price: PriceStats) -> Candidate:
     category_counts: dict[str, int] = {}
     for item in news:
@@ -259,30 +351,40 @@ def score_candidate(ticker: str, news: list[NewsItem], price: PriceStats) -> Can
     terminal = category_counts.get("terminal_risk", 0)
     legal = category_counts.get("legal_regulatory", 0)
 
-    score = 0.0
-    score += min(len(specific_events), 6) * 4
-    score += min(macro_event_count, 3) * 1
-    score += min(negative_event_count, 4) * 6
-    score += min(positive_event_count, 3) * 2
-    score += min(abs(price.drawdown_60d), 35) * 1.1 if price.drawdown_60d < -8 else -8
-    score += min(abs(price.change_20d), 25) * 0.8 if price.change_20d < -5 else -5
-    score += min(price.above_5d_low, 10) * 2.0
-    score += min(max(price.volume_ratio_5d_20d - 1, 0), 3) * 4
+    breakdown: dict[str, float] = {}
+    add_score(breakdown, "company-specific event count", min(len(specific_events), 6) * 4)
+    add_score(breakdown, "macro/sector event count", min(macro_event_count, 3) * 1)
+    add_score(breakdown, "negative event catalyst", min(negative_event_count, 4) * 6)
+    add_score(breakdown, "positive offsetting catalyst", min(positive_event_count, 3) * 2)
+    add_score(
+        breakdown,
+        "60-day drawdown",
+        min(abs(price.drawdown_60d), 35) * 1.1 if price.drawdown_60d < -8 else -8,
+    )
+    add_score(
+        breakdown,
+        "20-day selloff",
+        min(abs(price.change_20d), 25) * 0.8 if price.change_20d < -5 else -5,
+    )
+    add_score(breakdown, "bounce from 5-day low", min(price.above_5d_low, 10) * 2.0)
+    add_score(breakdown, "recent volume expansion", min(max(price.volume_ratio_5d_20d - 1, 0), 3) * 4)
 
     if category_counts.get("earnings_recoverable"):
-        score += 8
+        add_score(breakdown, "recoverable earnings/guidance event", 8)
     if category_counts.get("analyst_positive") or category_counts.get("company_action_positive"):
-        score += 6
+        add_score(breakdown, "constructive analyst/company action", 6)
     if category_counts.get("earnings_miss"):
-        score += 5
+        add_score(breakdown, "earnings disappointment catalyst", 5)
     if legal:
-        score -= legal * 8
+        add_score(breakdown, "legal/regulatory penalty", legal * -8)
     if terminal:
-        score -= terminal * 30
+        add_score(breakdown, "terminal-risk penalty", terminal * -30)
     if price.change_5d < -12 and price.above_5d_low < 2:
-        score -= 12
+        add_score(breakdown, "falling-knife penalty", -12)
     if not specific_events:
-        score -= 25
+        add_score(breakdown, "weak company-specific event penalty", -25)
+
+    score = sum(breakdown.values())
 
     risks = []
     if terminal:
@@ -313,16 +415,20 @@ def score_candidate(ticker: str, news: list[NewsItem], price: PriceStats) -> Can
     if price.above_5d_low > 2:
         thesis_parts.append(f"{price.above_5d_low:.1f}% above its 5-day low")
     if category_counts:
-        top_categories = sorted(category_counts, key=category_counts.get, reverse=True)[:3]
-        thesis_parts.append("recent events: " + ", ".join(top_categories))
+        thesis_parts.append("recent events: " + ", ".join(top_category_labels(category_counts)))
     thesis = "; ".join(thesis_parts) or "event activity detected but signal is weak"
+    reasons = build_reasons(news, category_counts, price, negative_event_count, positive_event_count)
+    watchpoints = build_watchpoints(category_counts, price)
 
     return Candidate(
         ticker=ticker,
         score=round(score, 2),
         bucket=bucket,
         thesis=thesis,
+        reasons=reasons,
         risks=risks,
+        watchpoints=watchpoints,
+        score_breakdown=breakdown,
         events=news,
         price=price,
     )
@@ -334,7 +440,10 @@ def candidate_to_dict(candidate: Candidate) -> dict:
         "score": candidate.score,
         "bucket": candidate.bucket,
         "thesis": candidate.thesis,
+        "reasons": candidate.reasons,
         "risks": candidate.risks,
+        "watchpoints": candidate.watchpoints,
+        "score_breakdown": candidate.score_breakdown,
         "price": dataclasses.asdict(candidate.price),
         "events": [
             {
@@ -347,6 +456,10 @@ def candidate_to_dict(candidate: Candidate) -> dict:
             for event in candidate.events
         ],
     }
+
+
+def markdown_escape(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
 
 
 def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, str]:
@@ -364,20 +477,48 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
         handle.write("# Weekly Event-Only Bottom-Fishing Watchlist\n\n")
         handle.write(f"Generated: {payload['generated_at']}\n\n")
         handle.write("This is a research watchlist, not investment advice or an auto-trading signal.\n\n")
-        handle.write("| Rank | Ticker | Bucket | Score | Event Thesis | Key Risk |\n")
-        handle.write("| ---: | --- | --- | ---: | --- | --- |\n")
+        handle.write("| Rank | Ticker | Bucket | Score | Setup | Why It Made The List | Key Risk |\n")
+        handle.write("| ---: | --- | --- | ---: | --- | --- | --- |\n")
         for index, candidate in enumerate(candidates, start=1):
             risk = candidate.risks[0] if candidate.risks else ""
+            reason = candidate.reasons[0] if candidate.reasons else ""
             handle.write(
                 f"| {index} | {candidate.ticker} | {candidate.bucket} | "
-                f"{candidate.score:.2f} | {candidate.thesis} | {risk} |\n"
+                f"{candidate.score:.2f} | {markdown_escape(candidate.thesis)} | "
+                f"{markdown_escape(reason)} | {markdown_escape(risk)} |\n"
             )
-        handle.write("\n## Event Details\n\n")
+        handle.write("\n## Candidate Rationale\n\n")
         for candidate in candidates:
             handle.write(f"### {candidate.ticker}\n\n")
+            handle.write(f"**Score:** {candidate.score:.2f}  \n")
+            handle.write(f"**Bucket:** {candidate.bucket}  \n")
+            handle.write(f"**Setup:** {candidate.thesis}\n\n")
+
+            handle.write("**Why it made the list**\n\n")
+            for reason in candidate.reasons:
+                handle.write(f"- {reason}\n")
+            handle.write("\n")
+
+            handle.write("**What could break the thesis**\n\n")
+            for risk in candidate.risks:
+                handle.write(f"- {risk}\n")
+            handle.write("\n")
+
+            handle.write("**What to verify next**\n\n")
+            for watchpoint in candidate.watchpoints:
+                handle.write(f"- {watchpoint}\n")
+            handle.write("\n")
+
+            handle.write("**Score breakdown**\n\n")
+            for label, value in candidate.score_breakdown.items():
+                handle.write(f"- {label}: {value:+.2f}\n")
+            handle.write("\n")
+
+            handle.write("**Event evidence**\n\n")
             for event in candidate.events[:5]:
                 date = event.published.date().isoformat() if event.published else "unknown date"
-                handle.write(f"- {date}: [{event.title}]({event.link})\n")
+                categories = ", ".join(event_label(category) for category in event.categories)
+                handle.write(f"- {date}: [{event.title}]({event.link}) ({categories})\n")
             handle.write("\n")
     return json_path, md_path
 

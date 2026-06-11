@@ -1,0 +1,31 @@
+name: Weekly event-driven stock email
+
+on:
+  schedule:
+    # Monday 13:00 UTC. This is before the US market open in both EDT and EST.
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+
+jobs:
+  send-weekly-email:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate watchlist and send email
+        env:
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "587"
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+        run: python3 src/email_weekly_report.py --to lvyongyu@gmail.com
