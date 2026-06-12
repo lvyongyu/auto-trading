@@ -1,677 +1,472 @@
 # AI Agent Research System Design
 
-## Goal
+## Purpose
 
-Build an AI-agent-first research system for US stock bottom-fishing candidates.
+This project is a research system for event-driven US stock bottom-fishing.
+It is not an auto-trader and it does not predict prices directly.
 
-The current screener can still provide the initial candidate pool, but the professional version should not be a rules engine with agent names attached. The core system should be a group of AI research agents that can investigate, reason, challenge each other, and produce an auditable watchlist.
+The goal is narrower and more useful:
 
-The system should not predict stock prices directly. Its value should come from:
+1. find names that sold off after a real event
+2. explain why the setup may be temporary or structural
+3. surface the 10 stocks most worth human attention
+4. narrow those 10 down to 2-3 serious deep-dive candidates
+5. show the evidence, missing evidence, and risk gate behind every conclusion
 
-- Reading primary evidence before trusting commentary
-- Comparing multiple data sources
-- Explaining why a selloff may be temporary or structural
-- Separating good businesses on sale from weak businesses getting weaker
-- Producing bull and bear cases
-- Blocking candidates with unacceptable risk
-- Creating a research note that a human can inspect
+The system should behave like a small research desk, not like a single scoring function with a fancy label.
 
-The output remains a research watchlist, not investment advice and not an automatic trade instruction.
+## Design Principles
 
-## Core Position
+The design is intentionally opinionated.
 
-This project should be designed as an AI agent system from the start.
+- Event context comes first
+- Primary evidence beats commentary
+- SEC filings outrank headlines
+- Business quality matters more than cheapness alone
+- Structural risk can block a candidate even when the price looks attractive
+- Reasoning matters as much as the final rank
+- Every output should be auditable
+- Token usage should be explicit and bounded
 
-Rules, deterministic scores, and data loaders still matter, but they should be tools used by agents, not the main architecture.
+The most important product idea is not "LLM predicts stock price".
+It is "LLM helps convert noisy event data into a readable research packet".
 
-```text
-AI agents decide what question to answer.
-Tools provide data and deterministic calculations.
-Guardrails constrain unsafe or low-quality conclusions.
-Reports expose the reasoning and evidence.
-```
+## Current System Shape
 
-This avoids building a fixed scoring pipeline first and later trying to retrofit autonomy into it.
-
-## High-Level Architecture
-
-```text
-Candidate Generator
-        |
-        v
-Orchestrator Agent
-        |
-        +--> News Agent
-        +--> SEC Filing Agent
-        +--> Financial Agent
-        +--> Technical Agent
-        +--> Sentiment Agent
-        |
-        v
-Debate Agent
-        |
-        v
-Risk Agent
-        |
-        v
-Trade Review Agent
-        |
-        v
-Daily Research Report
-```
-
-The candidate generator can be the existing event-driven bottom-fishing screener. It narrows the market to a manageable list, such as 10 stocks per day.
-
-The AI agents then perform deeper research on those candidates and reduce the list to 2-3 stocks worth serious manual review.
-
-## What Makes These AI Agents
-
-Each agent should have:
-
-- A mission, not just a formula
-- Access to a defined toolset
-- A structured output schema
-- Evidence requirements
-- Confidence calibration
-- Counterarguments
-- A list of missing evidence
-
-An agent should not merely produce a score. It should answer a research question.
-
-Example:
+The current codebase already implements a real version of this design.
 
 ```text
-Bad:
-SEC Agent returns recent filing count.
-
-Good:
-SEC Agent determines whether the selloff is supported by new primary disclosures,
-whether the issue looks temporary or structural, and what evidence is missing.
+Event Screener
+    |
+    v
+Deep Dive Filter
+    |
+    v
+Agent Runtime
+    |
+    +--> News / SEC / Financial / Technical / Sentiment
+    |
+    +--> Debate
+    |
+    +--> Risk
+    |
+    v
+Report Writer
 ```
 
-## Orchestrator Agent
+The screener still does the first-pass narrowing.
+The agent runtime then adds structured research, committee-style reasoning, and a final risk-aware recommendation.
 
-Purpose: plan and coordinate the research process for each candidate.
+## Repository Layout
 
-Main question:
+The current implementation is split by responsibility:
 
-```text
-What needs to be investigated before this stock can be classified as Focus, Watch, Pass, or Blocked?
-```
+- `src/event_bottom_fishing.py`: candidate generation, event scoring, CLI
+- `src/agent_runtime.py`: agent plan, tool orchestration, optional LLM overlay
+- `src/models.py`: shared dataclasses and structured outputs
+- `src/llm_prompts.py`: prompt templates and token helpers
+- `src/reporting.py`: Markdown and JSON rendering
+- `src/data_sources.py`: price, news, and SEC retrieval helpers
+- `src/scoring.py`: deterministic scoring helpers
 
-Responsibilities:
+This split matters because it keeps reasoning, retrieval, scoring, and rendering from collapsing into one giant file.
 
-- Read the initial screener output
-- Identify the event thesis for each candidate
-- Assign subtasks to specialist agents
-- Decide which tools are needed
-- Track missing evidence
-- Ask for follow-up analysis when an agent result is weak or contradictory
-- Produce a complete research packet for Debate Agent
+## Pipeline
 
-Example task:
+### 1. Candidate Generation
 
-```json
-{
-  "ticker": "ADBE",
-  "research_goal": "Determine whether the drawdown is an earnings reset or a structural growth concern.",
-  "required_agents": ["news", "sec_filing", "financial", "technical"],
-  "optional_agents": ["sentiment"],
-  "priority_questions": [
-    "Was the selloff caused by guidance, margins, AI disruption, or macro pressure?",
-    "Do filings or earnings materials confirm a permanent deterioration?",
-    "Is valuation now reasonable relative to growth quality?"
-  ]
-}
-```
+The screener starts with a universe of US stocks.
+It fetches recent event headlines and price context, then assigns a first-pass score.
 
-## News Agent
+The first-pass score is designed to answer one question:
 
-Purpose: understand the market narrative and event catalyst.
+> Is this stock interesting enough to justify a deeper human look?
 
-Main question:
+Signals in this stage include:
 
-```text
-What event caused or explains the selloff, and how credible is the narrative?
-```
+- negative or mixed event catalysts
+- drawdown from the recent high
+- early stabilization near the low
+- company-specific headlines vs broad macro noise
+- obvious terminal-risk language
 
-Tools:
+This stage is intentionally lightweight.
+It should be fast, deterministic, and easy to inspect.
 
-- News RSS/search tool
-- Company press release tool
-- Source deduplication tool
-- Event classifier
+### 2. Deep Dive Filter
 
-Outputs:
+The deep dive stage narrows the first-pass top 10 to 2-3 names.
 
-- Main catalyst
-- Narrative summary
-- Source list
-- Source credibility
-- Whether coverage is independent or syndicated
-- Bullish interpretation
-- Bearish interpretation
-- Missing primary evidence
+This stage adds the structure that the user asked for:
 
-Important rule:
+- Business Quality Score
+- Valuation Score
+- Structural Risk Penalty
+- Deep Dive Score
 
-News can explain market reaction, but it should not prove business quality. If news claims a major structural issue, the SEC Filing Agent and Financial Agent must verify it.
+The point of this stage is to avoid ranking a stock too high just because it fell a lot.
+A cheap bad business is still a bad business.
 
-## SEC Filing Agent
+### 3. Agent Runtime
 
-Purpose: read primary disclosures and determine whether the market narrative is supported by company filings.
+The agent runtime is the research layer.
+It takes the shortlisted candidates and runs a structured multi-step review.
 
-Main question:
+The current plan contains these specialist agents:
 
-```text
-Does primary company disclosure show temporary pressure, structural deterioration, legal risk, accounting risk, or no clear confirmation?
-```
+- News Agent
+- SEC Filing Agent
+- Financial Agent
+- Technical Agent
+- Sentiment Agent
+- Debate Agent
+- Risk Agent
 
-Tools:
+Each agent has a mission, a tool bundle, a short prompt, and a structured output.
 
-- SEC submissions API
-- SEC company facts API
-- 8-K parser
-- 10-Q / 10-K section extractor
-- Risk factor diff tool
-- Filing quote extractor
+### 4. Final Review
 
-Outputs:
+The final review decides whether a candidate becomes:
 
-- Relevant filings
-- Filing-based thesis
-- New risks
-- Changed risk language
-- Accounting or liquidity concerns
-- Evidence quotes or evidence IDs
-- Confidence
-- Missing filings or documents
+- `Focus`
+- `Watch`
+- `Pass`
+- `Blocked`
 
-This agent should carry high authority. SEC evidence should outweigh headlines, Reddit, and broad market commentary.
+This is not just a numeric threshold.
+It is a research decision that combines:
 
-## Financial Agent
+- the deep dive score
+- evidence quality
+- debate results
+- risk gate output
+- missing evidence
 
-Purpose: decide whether the company is fundamentally worth researching as a bottom-fishing candidate.
+### 5. Report Writing
 
-Main question:
+The output layer writes both Markdown and JSON.
 
-```text
-Is this a good or improving business whose valuation has become more interesting, or a weak business that merely got cheaper?
-```
+The report exposes:
 
-Tools:
+- ranking
+- rationale
+- deep dive reasoning
+- agent committee results
+- tool trace
+- risk notes
+- missing evidence
 
-- SEC company facts tool
-- Financial metrics calculator
-- Valuation calculator
-- Peer comparison tool
-- Historical growth and margin tool
+This makes the daily run readable by a human and machine-parseable by downstream automation.
 
-Outputs:
+## Agent Modes
 
-- Business quality conclusion
-- Valuation conclusion
-- Growth and margin summary
-- Balance sheet concerns
-- Structural risk view
-- Peer-relative context
-- Confidence
-- Missing financial data
+The system supports three modes.
 
-This agent should prevent names like low-quality cyclicals, structurally impaired businesses, or balance-sheet-stressed companies from ranking too high just because they dropped.
+### `deterministic`
 
-## Technical Agent
+No LLM calls.
+All agent conclusions are produced by deterministic logic.
 
-Purpose: judge timing and stabilization, not business quality.
+Use this mode when:
 
-Main question:
+- testing the pipeline
+- avoiding token spend
+- running in environments without an API key
+- wanting stable, cheap daily runs
 
-```text
-Is the stock showing signs of stabilization, or is it still a falling knife?
-```
+### `lean`
 
-Tools:
+One compact LLM synthesis per reviewed candidate.
 
-- Daily price tool
-- Volume tool
-- Relative strength tool
-- Drawdown calculator
-- Moving average and stabilization calculator
+Use this mode when:
 
-Outputs:
+- you want a lightweight AI layer
+- you want the summary and classification to sound more like a research note
+- you want to keep token usage low
 
-- Drawdown context
-- Short-term stabilization
-- Volume confirmation
-- Relative strength vs SPY / QQQ / sector ETF
-- Falling-knife warning
-- Timing confidence
+This is the default behavior when `OPENAI_API_KEY` is present.
 
-Technical evidence should affect urgency and timing. It should not turn a low-quality business into a Focus candidate.
+### `full`
 
-## Sentiment Agent
+LLM support for each agent step plus the final synthesis.
 
-Purpose: measure crowd narrative and retail positioning risk.
+Use this mode when:
 
-Main question:
+- you want the richest reasoning output
+- you are doing design work or backtesting the workflow
+- token cost matters less than depth
 
-```text
-Is public sentiment creating opportunity, crowding risk, or noise?
-```
+This mode is the closest thing to a "multi-agent research desk" inside the current codebase.
 
-Tools:
+## Agent Responsibilities
 
-- Reddit ingestion tool
-- Social mention velocity tool
-- Sentiment classifier
-- Narrative clustering tool
+### News Agent
 
-Outputs:
+The News Agent answers:
 
-- Mention velocity
-- Dominant retail narratives
-- Sentiment direction
-- One-sidedness
-- Meme or crowding risk
-- Contrarian signal, if any
+> What event caused the selloff, and is the narrative coherent?
 
-Important rule:
+It looks at the event headlines and classifies whether the story is:
 
-Sentiment has low source credibility by default. It can flag crowd behavior, but it should not override SEC filings, financials, or clear risk evidence.
+- recoverable
+- noisy
+- negative
+- structurally alarming
 
-## Debate Agent
+It should not claim business quality.
+It only explains the event narrative.
 
-Purpose: force the research to confront both sides.
+### SEC Filing Agent
 
-Main question:
+The SEC Filing Agent answers:
 
-```text
-What is the strongest bull case, what is the strongest bear case, and what evidence would change the conclusion?
-```
+> Do primary filings support the market story?
 
-Inputs:
+This agent is high authority.
 
-- All specialist agent results
-- Evidence quality scores
-- Source credibility
-- Missing evidence
+If SEC evidence conflicts with the narrative, it should dominate the result.
+The agent is especially important for:
 
-Outputs:
+- liquidity risk
+- accounting risk
+- guidance changes
+- risk factor changes
+- structural deterioration
 
-- Bull thesis
-- Bear thesis
-- Points of agreement
-- Points of disagreement
-- Key evidence
-- Open questions
-- Debate conclusion
+### Financial Agent
 
-The Debate Agent should not simply average agent scores. It should identify the central disagreement.
+The Financial Agent answers:
 
-Example:
+> Is this a good business that got cheaper, or a weak business that just got less expensive?
 
-```text
-Bull case:
-- The selloff is tied to guidance reset rather than solvency or demand collapse.
-- Business quality remains high.
-- Valuation has improved enough to justify manual research.
+This is where the Business Quality Score and Valuation Score matter.
 
-Bear case:
-- Management commentary suggests growth durability may be weaker.
-- Technical stabilization is not yet clear.
-- Evidence quality is medium because primary documents are incomplete.
-```
+The purpose is to prevent low-quality names from ranking too high just because the chart looks oversold.
 
-## Risk Agent
+### Technical Agent
 
-Purpose: protect the final shortlist from attractive-looking but dangerous setups.
+The Technical Agent answers:
 
-Main question:
+> Is the stock stabilizing, or is it still a falling knife?
 
-```text
-Should this candidate be blocked, downgraded, or allowed into the final research shortlist?
-```
+This agent only judges timing and setup quality.
+It should not rescue a structurally poor business.
 
-Tools:
+### Sentiment Agent
 
-- Structural risk classifier
-- Legal/regulatory risk detector
-- Balance-sheet stress checker
-- Data quality checker
-- Falling-knife checker
+The Sentiment Agent answers:
 
-Outputs:
+> Is crowd behavior creating opportunity, noise, or danger?
 
-- Risk rating: Low / Medium / High / Blocked
-- Blocking reasons
-- Structural risk summary
-- Data quality concerns
-- Required human checks
-- Final risk gate decision
+This signal is intentionally low trust.
+It can help with crowding risk and narrative detection, but it should not outrank filings or fundamentals.
 
-Hard blocks:
+### Debate Agent
 
-- Bankruptcy or going-concern risk
-- Fraud or accounting irregularity
-- Delisting or severe liquidity issue
-- Major unresolved legal/regulatory risk
-- High structural risk with weak business quality
-- Evidence quality too low for the claimed thesis
+The Debate Agent forces the system to confront both sides.
 
-Risk Agent should have veto power. A candidate can have an attractive event setup and still be blocked.
+It answers:
 
-## Trade Review Agent
+> What is the strongest bull case, what is the strongest bear case, and what evidence would change the conclusion?
 
-Purpose: convert the research packet into a human-readable action.
+This is the most useful part of the AI layer.
+It turns multiple partial views into a single research argument.
 
-This agent should not place trades.
+### Risk Agent
 
-Actions:
+The Risk Agent protects the shortlist.
 
-- `Focus`: worth serious manual research now
-- `Watch`: interesting, but not ready
-- `Pass`: not worth time this cycle
-- `Blocked`: risk or evidence quality invalidates the setup
+It answers:
 
-Outputs:
+> Should this candidate be blocked, downgraded, or allowed through?
 
-- Final action
-- Research rationale
-- Main bull case
-- Main bear case
-- Evidence quality
-- Risk rating
-- Invalidation conditions
-- Next verification event
+It has veto power.
 
-Example:
-
-```text
-Action: Focus
-Reason:
-- Selloff appears tied to a checkable earnings/guidance reset.
-- Business quality remains high.
-- Valuation is more reasonable than before the drawdown.
-- No hard risk block found.
-
-Main risk:
-- Technical stabilization is early and the next earnings call must confirm margin durability.
-```
-
-## Agent Output Schema
-
-Every agent should return structured output.
-
-```json
-{
-  "agent": "sec_filing",
-  "ticker": "ADBE",
-  "task": "Determine whether recent filings support a structural risk thesis.",
-  "conclusion": "No hard structural risk found in recent filings, but growth durability needs transcript confirmation.",
-  "stance": "mixed_positive",
-  "confidence": 0.68,
-  "evidence": [
-    {
-      "source_type": "sec_filing",
-      "source": "10-Q",
-      "date": "2026-05-08",
-      "claim": "Risk language does not indicate a new liquidity or solvency issue.",
-      "credibility": 1.0
-    }
-  ],
-  "counterarguments": [
-    "Risk language around demand uncertainty expanded compared with prior filing."
-  ],
-  "missing_evidence": [
-    "Latest earnings call transcript",
-    "Management commentary on AI-related competitive pressure"
-  ],
-  "risk_flags": [],
-  "recommended_next_steps": [
-    "Run transcript analysis before promoting to Focus."
-  ]
-}
-```
+That means a candidate can still be blocked even if the event setup looks attractive.
+That is a feature, not a bug.
 
 ## Tool Layer
 
-Tools should be deterministic, testable functions. Agents call tools; tools should not make investment judgments.
+Tools are deterministic helpers.
+They fetch or compute information, but they do not decide what the stock means.
 
-Initial tools:
+Typical tool categories:
 
-- `price_history_tool`
-- `news_search_tool`
-- `sec_submissions_tool`
-- `sec_company_facts_tool`
-- `filing_text_tool`
-- `financial_metrics_tool`
-- `valuation_tool`
-- `technical_indicators_tool`
-- `report_writer_tool`
+- news summaries
+- SEC filings and company facts
+- price history
+- technical context
+- risk rules
+- committee summaries
 
-Later tools:
+The rule is simple:
 
-- `earnings_transcript_tool`
-- `risk_factor_diff_tool`
-- `peer_comparison_tool`
-- `reddit_sentiment_tool`
-- `source_hit_rate_tool`
-- `memory_store_tool`
+- tools retrieve and calculate
+- agents reason
+- reports explain
 
-Tool output should include:
-
-- Raw data reference
-- Timestamp
-- Source URL or source ID
-- Data freshness
-- Parsing confidence
-- Any failure or partial-data warning
+This separation keeps the system understandable.
 
 ## Evidence Quality
 
-Evidence quality should be dynamic. It should affect confidence and final action.
+Evidence quality is a separate concept from score.
 
-Inputs:
+It answers:
 
-- Source credibility
-- Primary-source confirmation
-- Number of independent sources
-- Consistency between sources
-- Data freshness
-- Completeness of required evidence
-- Historical source hit rate
+> How much should we trust this research packet?
 
-Initial source credibility:
+Evidence quality depends on:
 
-```text
-SEC filings:          1.00
-Company reports:      0.90
-Earnings transcripts: 0.85
-Reuters/Bloomberg:    0.80
-Major financial news: 0.65
-Yahoo RSS headlines:  0.45
-Reddit/social:        0.20
-```
+- source credibility
+- primary-source confirmation
+- source consistency
+- source independence
+- data freshness
+- evidence completeness
 
-Suggested score:
+Credibility should be weighted roughly like this:
 
-```text
-evidence_quality =
-  0.30 * source_credibility
-+ 0.25 * primary_source_confirmation
-+ 0.15 * source_consistency
-+ 0.10 * source_independence
-+ 0.10 * data_freshness
-+ 0.10 * evidence_completeness
-```
+- SEC filings: highest trust
+- company disclosures and transcripts: high trust
+- major financial news: medium trust
+- Yahoo headlines: lower trust
+- social sentiment: lowest trust
 
-Historical hit rate can be added after enough daily outputs are stored.
+The critical design choice is that low evidence quality should change the decision, not just shave a few points off a score.
 
-Low evidence quality should not just reduce a numeric score. It should change the action from `Focus` to `Watch` or `Pass`.
+## Scoring Model
 
-## Scoring and Guardrails
+The current system uses deterministic scores as guardrails, not as the final answer.
 
-The AI agents should produce reasoning first. Scores should summarize the reasoning, not replace it.
+Main score components:
 
-The system can still maintain deterministic scoring components:
+- event opportunity
+- business quality
+- valuation
+- structural risk penalty
+- data confidence
+- technical stabilization
 
-- Event opportunity score
-- Business quality score
-- Valuation score
-- Technical stabilization score
-- Structural risk penalty
-- Legal/regulatory risk penalty
-- Evidence quality score
+This keeps the system honest in two ways:
 
-But final classification should be governed by:
+1. the LLM does not invent the entire ranking
+2. the ranking is still explainable if the LLM is unavailable
+
+The correct mental model is:
 
 ```text
-agent conclusions
-+ evidence quality
-+ risk gate
-+ deterministic scores
-+ human-readable rationale
+deterministic scores = structure and guardrails
+agent reasoning = interpretation and judgment
+report = explanation and audit trail
 ```
 
-Guardrails:
+## Decision Rules
 
-- No Focus without a bear case
-- No Focus with high structural risk
-- No Focus with low evidence quality
-- No Focus if primary documents contradict the thesis
-- No automatic trading
-- Every report must expose evidence and uncertainty
+The final classification should follow a few hard rules:
+
+- no `Focus` without a bear case
+- no `Focus` with high structural risk
+- no `Focus` with low evidence quality
+- no `Focus` if primary filings contradict the thesis
+- no automatic trading
+- every candidate must show why it made the list
+- every candidate must show what could break the thesis
+
+These guardrails are more important than a small score difference.
+
+## Output Contract
+
+Every reviewed candidate should include:
+
+- final action
+- review score
+- evidence quality
+- risk rating
+- reasoning
+- main bull case
+- main bear case
+- missing evidence
+- invalidation conditions
+- agent plan
+- tool trace
+
+This is what makes the system usable in practice.
+
+The report should answer the reader's real question:
+
+> Why is this name on the list, and what would make us change our mind?
+
+## Token Strategy
+
+Token control is a first-class design constraint.
+
+The system should spend LLM budget where it creates value:
+
+- the final synthesis
+- debate and risk framing
+- the hardest candidates
+
+The system should avoid spending tokens on:
+
+- long raw article dumps
+- redundant prompt context
+- unnecessary repeated calls on low-priority names
+
+This is why the code supports `deterministic`, `lean`, and `full`.
 
 ## Daily Workflow
 
 ```text
-1. Candidate Generator selects top 10 event-driven bottom-fishing candidates.
-2. Orchestrator Agent creates a research plan for each candidate.
-3. Specialist agents investigate each candidate with tools.
-4. Debate Agent writes bull and bear cases.
-5. Risk Agent applies vetoes and downgrades.
-6. Trade Review Agent classifies Focus / Watch / Pass / Blocked.
-7. Report writer produces the daily email and artifacts.
+1. Candidate generator selects the daily event-driven universe.
+2. Deep dive ranks the top candidates.
+3. Agent runtime reviews the most important names.
+4. Debate and risk gate consolidate the reasoning.
+5. Report writer produces Markdown and JSON.
+6. GitHub Actions can publish the result on a schedule.
 ```
 
-Expected final report:
+The current workflow is designed to run before the US market open on weekdays.
+
+## Extensibility Roadmap
+
+The design leaves space for future upgrades without forcing them into the first version.
+
+Good next additions:
+
+- earnings transcript ingestion
+- 8-K and 10-Q section extraction
+- risk factor diffing
+- better source credibility calibration
+- source hit-rate tracking
+- social sentiment ingestion
+- memory of past thesis outcomes
+
+These should be added as tools or data sources, not as ad hoc prompt text.
+
+## What This System Is Not
+
+This project is not:
+
+- a price prediction engine
+- a black-box ranking model
+- an automatic execution bot
+- a high-frequency trading system
+- a social sentiment scraper with agent labels
+
+It is a research workflow for finding and explaining event-driven bottom-fishing ideas.
+
+## Design Summary
+
+The best way to think about this system is:
 
 ```text
-Daily AI Research Shortlist
-
-Rank | Ticker | Action | Evidence Quality | Risk | Main Bull Case | Main Bear Case | Next Check
+event screen
++ deterministic guardrails
++ agent reasoning
++ evidence trace
++ risk gate
+= daily research shortlist
 ```
 
-Each candidate should include:
-
-- Agent summary
-- Key evidence
-- Debate
-- Risk gate decision
-- Final action
-- Missing evidence
-- Human follow-up checklist
-
-## Memory and Feedback
-
-The system should store past research packets.
-
-Useful memory:
-
-- Daily candidate list
-- Agent conclusions
-- Evidence sources
-- Final action
-- Forward returns
-- Maximum drawdown after selection
-- Whether the thesis was invalidated
-- Which sources were useful
-
-This enables:
-
-- Source hit-rate estimation
-- Agent calibration
-- Better evidence weighting
-- Detection of repeated mistakes
-
-Memory should not blindly reinforce prior conclusions. It should be used for calibration and auditability.
-
-## Implementation Phases
-
-### Phase 1: Agent Runtime and Schemas
-
-No new paid data sources required.
-
-- Define `AgentTask`
-- Define `AgentContext`
-- Define `AgentResult`
-- Define `Evidence`
-- Define `ToolResult`
-- Add JSON schema validation
-- Add deterministic mock mode for tests
-- Add report structure for agent outputs
-
-Goal: create the real AI-agent interface before adding complex behavior.
-
-### Phase 2: Tool Layer
-
-- Wrap current price/news/SEC/fundamental functions as tools
-- Make tool outputs structured and timestamped
-- Add source IDs and data freshness
-- Add failure handling
-- Keep tools deterministic and testable
-
-Goal: give agents reliable tools without mixing tool code with reasoning.
-
-### Phase 3: First AI-Agent Workflow
-
-- Use the existing screener to select 10 candidates
-- Run Orchestrator Agent
-- Run News, SEC Filing, Financial, Technical agents
-- Run Debate Agent
-- Run Risk Agent
-- Run Trade Review Agent
-- Produce 2-3 Focus/Watch candidates
-
-Goal: make the daily report agent-driven while keeping scope controlled.
-
-### Phase 4: Primary Document Depth
-
-- Add 8-K text extraction
-- Add 10-Q/10-K section extraction
-- Add risk factor diffing
-- Add earnings transcript ingestion if a reliable source is available
-
-Goal: make SEC and transcript analysis the highest-value part of the system.
-
-### Phase 5: Sentiment and Reddit
-
-- Add Reddit ingestion
-- Add mention velocity
-- Add narrative clustering
-- Add one-sided sentiment risk
-- Keep low source credibility until backtested
-
-Goal: understand crowd behavior without letting it dominate the thesis.
-
-### Phase 6: Memory and Calibration
-
-- Store daily research packets
-- Track forward outcomes
-- Estimate source hit rates
-- Calibrate confidence
-- Identify repeated false-positive patterns
-
-Goal: make the system improve through audit and feedback.
-
-## Design Principles
-
-- AI agents own research questions; tools own data retrieval and deterministic calculations.
-- Primary evidence beats commentary.
-- SEC filings and financials outrank social sentiment.
-- Scores summarize reasoning; they do not replace reasoning.
-- Risk Agent has veto power.
-- Every Focus candidate must include a bear case.
-- Every conclusion must expose evidence, confidence, and missing data.
-- The system should prefer `Watch` over forcing a weak `Focus`.
-- No automatic trading without a separate explicit design and approval.
+That is the core architecture.
+Everything else should support it.
