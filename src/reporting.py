@@ -135,14 +135,14 @@ def write_outputs(candidates: list[Candidate], path_prefix: str) -> tuple[str, s
     md_path = f"{path_prefix}.md"
     payload = {
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "method": "event-only bottom-fishing watchlist; not investment advice",
+        "method": "event-first bottom-fishing watchlist; not investment advice",
         "candidates": [candidate_to_dict(candidate) for candidate in candidates],
     }
     with open(json_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
 
     with open(md_path, "w", encoding="utf-8") as handle:
-        handle.write("# Daily Event-Only Bottom-Fishing Watchlist\n\n")
+        handle.write("# Daily Event-First Bottom-Fishing Watchlist\n\n")
         handle.write(f"Generated: {payload['generated_at']}\n\n")
         handle.write("This is a research watchlist, not investment advice or an auto-trading signal.\n\n")
 

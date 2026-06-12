@@ -1,4 +1,4 @@
-# Event-Only US Stock Bottom-Fishing Agent
+# Event-First US Stock Bottom-Fishing Agent
 
 This project is a daily research engine for US stocks that sold off after real events.
 It is not an auto-trader and not investment advice.
