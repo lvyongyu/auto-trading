@@ -16,6 +16,10 @@ from models import AgentPlan, AgentResult, AgentReview, AgentTask, Candidate, Ev
 from scoring import count_categories, multiple, pct, top_category_labels
 
 
+def _log(message: str) -> None:
+    print(f"[agent] {message}", flush=True)
+
+
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
@@ -250,10 +254,10 @@ def _tool_bundle(candidate: Candidate, task: AgentTask, facts: dict | None, agen
     return bundle
 
 
-def _call_openai_json(prompt: str, model: str, max_output_tokens: int) -> dict | None:
+def _call_openai_json(prompt: str, model: str, max_output_tokens: int) -> tuple[dict | None, dict[str, int] | None]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        return None
+        return None, None
     payload = {
         "model": model,
         "input": [
@@ -274,6 +278,7 @@ def _call_openai_json(prompt: str, model: str, max_output_tokens: int) -> dict |
     )
     with urllib.request.urlopen(req, timeout=30) as response:
         result = json.loads(response.read().decode("utf-8"))
+    usage = result.get("usage")
     text_parts = []
     for item in result.get("output", []):
         for content in item.get("content", []):
@@ -281,11 +286,24 @@ def _call_openai_json(prompt: str, model: str, max_output_tokens: int) -> dict |
                 text_parts.append(content.get("text", ""))
     text = "\n".join(text_parts).strip()
     if not text:
-        return None
+        return None, _normalize_usage(usage)
     try:
-        return json.loads(text)
+        return json.loads(text), _normalize_usage(usage)
     except json.JSONDecodeError:
-        return {"raw_text": text}
+        return {"raw_text": text}, _normalize_usage(usage)
+
+
+def _normalize_usage(payload: object) -> dict[str, int] | None:
+    if not isinstance(payload, dict):
+        return None
+    result: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = payload.get(key)
+        if isinstance(value, int):
+            result[key] = value
+    if not result:
+        return None
+    return result
 
 
 def _parse_task_result(payload: dict | None, fallback: AgentResult) -> AgentResult:
@@ -439,22 +457,25 @@ def _make_result_from_tools(candidate: Candidate, task: AgentTask, tool_results:
     )
 
 
-def _build_task_result(candidate: Candidate, task: AgentTask, facts: dict | None, agent_results: list[AgentResult], mode: str, model: str, max_output_tokens: int, token_budget: int) -> tuple[AgentResult, list[ToolResult]]:
+def _build_task_result(candidate: Candidate, task: AgentTask, facts: dict | None, agent_results: list[AgentResult], mode: str, model: str, max_output_tokens: int, token_budget: int) -> tuple[AgentResult, list[ToolResult], dict[str, int] | None, int]:
     tool_results = _tool_bundle(candidate, task, facts, agent_results)
     fallback = _make_result_from_tools(candidate, task, tool_results, agent_results)
+    prompt_estimate = 0
+    usage = None
     if not _mode_uses_task_llm(mode, task.agent):
         payload = None
     else:
         prompt = build_agent_task_prompt(candidate, task, tool_results, [result.conclusion for result in agent_results[-3:]], token_budget)
+        prompt_estimate = estimate_tokens(prompt)
         try:
-            payload = _call_openai_json(prompt, model, max_output_tokens)
+            payload, usage = _call_openai_json(prompt, model, max_output_tokens)
         except Exception as exc:  # noqa: BLE001
             fallback.next_steps = [f"OpenAI task failed: {exc}"] + fallback.next_steps
             payload = None
     result = _parse_task_result(payload, fallback)
     for tool in tool_results:
         tool.metadata["agent"] = task.agent
-    return result, tool_results
+    return result, tool_results, usage, prompt_estimate
 
 
 def _final_review(candidate: Candidate, agent_results: list[AgentResult], tool_trace: list[ToolResult], mode: str, model: str, token_budget: int, max_output_tokens: int) -> tuple[str, str, str]:
@@ -489,12 +510,30 @@ def build_agent_review(candidate: Candidate, token_budget: int, mode: str = "det
     facts = fetch_sec_company_facts(candidate.ticker, ticker_map)
     if not candidate.data_confidence.sec_filings:
         candidate.data_confidence.sec_filings = fetch_recent_sec_filings(candidate.ticker, ticker_map, 14)
+    _log(
+        f"{candidate.ticker} start mode={mode} deep_dive={candidate.deep_dive_decision} "
+        f"score={candidate.deep_dive_score:.2f} token_budget={token_budget} model={model}"
+    )
     agent_results: list[AgentResult] = []
     tool_trace: list[ToolResult] = []
+    estimated_prompt_tokens = 0
+    estimated_output_tokens = 0
+    actual_input_tokens = 0
+    actual_output_tokens = 0
     for task in plan.tasks:
-        result, tool_results = _build_task_result(candidate, task, facts, agent_results, mode, model, max_output_tokens, token_budget)
+        result, tool_results, usage, prompt_estimate = _build_task_result(candidate, task, facts, agent_results, mode, model, max_output_tokens, token_budget)
         agent_results.append(result)
         tool_trace.extend(tool_results)
+        estimated_prompt_tokens += prompt_estimate
+        estimated_output_tokens += max_output_tokens if _mode_uses_task_llm(mode, task.agent) else 0
+        if usage:
+            actual_input_tokens += usage.get("input_tokens", 0)
+            actual_output_tokens += usage.get("output_tokens", 0)
+        tool_summary = "; ".join(f"{tool.tool}:{tool.status}" for tool in tool_results) or "no-tools"
+        _log(
+            f"{candidate.ticker} task={task.agent} stance={result.stance} conf={result.confidence:.2f} "
+            f"prompt~{prompt_estimate} tool={tool_summary}"
+        )
 
     evidence_quality_score = 0.45
     if candidate.data_confidence.sec_filings:
@@ -559,10 +598,26 @@ def build_agent_review(candidate: Candidate, token_budget: int, mode: str = "det
         agent_plan=plan.tasks,
         tool_trace=tool_trace,
     )
+    total_estimated = estimated_prompt_tokens + estimated_output_tokens
+    if actual_input_tokens or actual_output_tokens:
+        _log(
+            f"{candidate.ticker} done decision={review.decision} risk={review.risk_rating} "
+            f"evidence={review.evidence_quality:.2f} score={review.review_score:.2f} "
+            f"tokens actual_in={actual_input_tokens} actual_out={actual_output_tokens} "
+            f"task_prompt_estimate={estimated_prompt_tokens} final_review_prompt_estimate={review.prompt_tokens_estimate} "
+            f"task_total_estimate~{total_estimated}"
+        )
+    else:
+        _log(
+            f"{candidate.ticker} done decision={review.decision} risk={review.risk_rating} "
+            f"evidence={review.evidence_quality:.2f} score={review.review_score:.2f} "
+            f"task_prompt_estimate={estimated_prompt_tokens} final_review_prompt_estimate={review.prompt_tokens_estimate} "
+            f"task_total_estimate~{total_estimated}"
+        )
     return review
 
 
-def apply_agent_reviews(candidates: list[Candidate], token_budget: int, mode: str = "deterministic", model: str = "gpt-4o-mini", max_output_tokens: int = 350, review_count: int = 1) -> list[Candidate]:
+def apply_agent_reviews(candidates: list[Candidate], token_budget: int, mode: str = "deterministic", model: str = "gpt-4o-mini", max_output_tokens: int = 350, review_count: int = 1, verbose: bool = True) -> list[Candidate]:
     ranked = sorted(candidates, key=lambda item: item.deep_dive_score, reverse=True)
     review_candidates = {candidate.ticker for candidate in ranked[:review_count]}
     for candidate in candidates:
@@ -574,4 +629,12 @@ def apply_agent_reviews(candidates: list[Candidate], token_budget: int, mode: st
                 model=model,
                 max_output_tokens=max_output_tokens,
             )
+    if verbose:
+        reviewed = [candidate for candidate in candidates if candidate.ticker in review_candidates]
+        total_prompt = sum(candidate.agent_review.prompt_tokens_estimate for candidate in reviewed)
+        _log(
+            "review batch "
+            f"candidates={len(reviewed)} mode={mode} final_review_prompt_total={total_prompt} "
+            f"review_count={review_count} model={model}"
+        )
     return candidates

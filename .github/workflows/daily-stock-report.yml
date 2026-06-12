@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Generate watchlist
-        run: python3 src/event_bottom_fishing.py --top 10
+        run: python3 -u src/event_bottom_fishing.py --top 10
 
       - name: Create GitHub issue report
         uses: actions/github-script@v7

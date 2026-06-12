@@ -1435,6 +1435,7 @@ def apply_agent_reviews(candidates: list[Candidate], args: argparse.Namespace) -
         model=args.agent_model,
         max_output_tokens=args.agent_max_output_tokens,
         review_count=args.agent_review_count,
+        verbose=True,
     )
 
 
