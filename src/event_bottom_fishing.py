@@ -37,7 +37,13 @@ from data_sources import (
     load_sec_ticker_map as load_sec_ticker_map_source,
     load_universe as load_universe_source,
 )
-from paper_portfolio import apply_paper_buy, append_paper_buy_to_outputs, archive_report
+from paper_portfolio import (
+    apply_paper_buy,
+    append_paper_buy_to_outputs,
+    append_performance_to_outputs,
+    archive_report,
+    update_portfolio_performance,
+)
 from reporting import write_outputs as render_outputs
 
 
@@ -1728,6 +1734,19 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
         else:
             print(f"[paper] no new buy; db={args.paper_portfolio_db}", flush=True)
+    performance_result = update_portfolio_performance(
+        args.paper_portfolio_db,
+        candidates,
+        run_date=today,
+    )
+    append_performance_to_outputs(md_path, json_path, performance_result)
+    print(
+        f"[paper] performance positions={performance_result['open_positions']} "
+        f"value=${performance_result['total_value']:.2f} "
+        f"pnl=${performance_result['total_unrealized_pnl']:.2f} "
+        f"return={performance_result['total_return_pct']:.2f}%",
+        flush=True,
+    )
     archive_result = archive_report(
         args.paper_portfolio_db,
         run_date=today,

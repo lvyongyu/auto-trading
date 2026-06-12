@@ -71,7 +71,7 @@ By default:
 
 The live S&P 500 universe and SEC company-name lookup are cached locally in `.cache/event-first/` and refreshed once a week. GitHub Actions restores the same cache directory between runs.
 
-After each report run, the project also updates a SQLite paper portfolio at `state/paper_portfolio.sqlite`. It simulates buying `$100` of the highest-ranked new report candidate and never buys the same ticker twice. The same DB archives each daily report, so GitHub Actions can commit the evolving research history back to the repository. This is a validation ledger for judging the research engine over time, not real trading.
+After each report run, the project also updates a SQLite paper portfolio at `state/paper_portfolio.sqlite`. It simulates buying `$100` of the highest-ranked new report candidate and never buys the same ticker twice. The DB archives each daily report and stores daily mark-to-market snapshots, so users can see open positions, unrealized P/L, and one-month or two-month holding performance as history accumulates. GitHub Actions commits the evolving research history back to the repository. This is a validation ledger for judging the research engine over time, not real trading.
 
 To run the full multi-agent version:
 

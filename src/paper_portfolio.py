@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from data_sources import fetch_price_stats
 from models import Candidate
 
 
@@ -77,6 +78,27 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS position_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            buy_date TEXT NOT NULL,
+            holding_days INTEGER NOT NULL,
+            notional REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            current_price REAL NOT NULL,
+            shares REAL NOT NULL,
+            market_value REAL NOT NULL,
+            unrealized_pnl REAL NOT NULL,
+            return_pct REAL NOT NULL,
+            status TEXT NOT NULL,
+            UNIQUE(run_date, ticker)
+        )
+        """
+    )
     conn.commit()
 
 
@@ -99,6 +121,13 @@ def portfolio_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         "open_positions": int(row["open_positions"] or 0),
         "total_notional": round(float(row["total_notional"] or 0), 2),
     }
+
+
+def _parse_date(value: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return dt.datetime.now().date()
 
 
 def _candidate_rank_key(candidate: Candidate) -> tuple[int, float, float, float]:
@@ -228,6 +257,110 @@ def apply_paper_buy(candidates: list[Candidate], db_path: str, buy_amount: float
         return result
 
 
+def _candidate_price_map(candidates: list[Candidate]) -> dict[str, float]:
+    return {
+        candidate.ticker.upper(): float(candidate.price.last_close)
+        for candidate in candidates
+        if candidate.price.last_close > 0
+    }
+
+
+def update_portfolio_performance(db_path: str, candidates: list[Candidate], run_date: str | None = None) -> dict[str, Any]:
+    run_date = run_date or dt.datetime.now().strftime("%Y-%m-%d")
+    run_day = _parse_date(run_date)
+    latest_prices = _candidate_price_map(candidates)
+    snapshots = []
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT ticker, buy_date, notional, price, shares, status
+            FROM positions
+            WHERE status = 'open'
+            ORDER BY buy_date, ticker
+            """
+        ).fetchall()
+        for row in rows:
+            ticker = str(row["ticker"]).upper()
+            current_price = latest_prices.get(ticker)
+            source = "report"
+            if current_price is None:
+                try:
+                    stats = fetch_price_stats(ticker)
+                    current_price = float(stats.last_close) if stats else None
+                    source = "live_price"
+                except Exception:  # noqa: BLE001 - price refresh should not break the report.
+                    current_price = None
+                    source = "missing"
+            if current_price is None or current_price <= 0:
+                continue
+
+            notional = float(row["notional"])
+            entry_price = float(row["price"])
+            shares = float(row["shares"])
+            market_value = shares * current_price
+            unrealized_pnl = market_value - notional
+            return_pct = (current_price / entry_price - 1) * 100 if entry_price else 0
+            holding_days = max(0, (run_day - _parse_date(str(row["buy_date"]))).days)
+            snapshot = {
+                "run_date": run_date,
+                "created_at": _now_utc(),
+                "ticker": ticker,
+                "buy_date": str(row["buy_date"]),
+                "holding_days": holding_days,
+                "notional": round(notional, 2),
+                "entry_price": round(entry_price, 4),
+                "current_price": round(current_price, 4),
+                "shares": round(shares, 8),
+                "market_value": round(market_value, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "return_pct": round(return_pct, 2),
+                "status": str(row["status"]),
+                "price_source": source,
+            }
+            snapshots.append(snapshot)
+            conn.execute(
+                """
+                INSERT INTO position_snapshots (
+                    run_date, created_at, ticker, buy_date, holding_days, notional,
+                    entry_price, current_price, shares, market_value,
+                    unrealized_pnl, return_pct, status
+                )
+                VALUES (
+                    :run_date, :created_at, :ticker, :buy_date, :holding_days, :notional,
+                    :entry_price, :current_price, :shares, :market_value,
+                    :unrealized_pnl, :return_pct, :status
+                )
+                ON CONFLICT(run_date, ticker) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    holding_days = excluded.holding_days,
+                    current_price = excluded.current_price,
+                    market_value = excluded.market_value,
+                    unrealized_pnl = excluded.unrealized_pnl,
+                    return_pct = excluded.return_pct,
+                    status = excluded.status
+                """,
+                snapshot,
+            )
+        conn.commit()
+
+    total_cost = sum(float(item["notional"]) for item in snapshots)
+    total_value = sum(float(item["market_value"]) for item in snapshots)
+    total_pnl = total_value - total_cost
+    total_return_pct = (total_value / total_cost - 1) * 100 if total_cost else 0
+    return {
+        "run_date": run_date,
+        "db_path": db_path,
+        "open_positions": len(snapshots),
+        "total_cost": round(total_cost, 2),
+        "total_value": round(total_value, 2),
+        "total_unrealized_pnl": round(total_pnl, 2),
+        "total_return_pct": round(total_return_pct, 2),
+        "positions": snapshots,
+        "winners": sum(1 for item in snapshots if float(item["unrealized_pnl"]) > 0),
+        "losers": sum(1 for item in snapshots if float(item["unrealized_pnl"]) < 0),
+    }
+
+
 def append_paper_buy_to_outputs(markdown_path: str, json_path: str, result: dict[str, Any]) -> None:
     position = result.get("position")
     with open(markdown_path, "a", encoding="utf-8") as handle:
@@ -254,6 +387,41 @@ def append_paper_buy_to_outputs(markdown_path: str, json_path: str, result: dict
         return
     if isinstance(payload, dict):
         payload["paper_portfolio_buy"] = result
+        Path(json_path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def append_performance_to_outputs(markdown_path: str, json_path: str, result: dict[str, Any]) -> None:
+    positions = result.get("positions", [])
+    with open(markdown_path, "a", encoding="utf-8") as handle:
+        handle.write("\n## Paper Portfolio Performance\n\n")
+        handle.write("Daily mark-to-market for the simulated validation portfolio.\n\n")
+        handle.write(f"- Open positions: {result.get('open_positions', 0)}\n")
+        handle.write(f"- Total cost: ${float(result.get('total_cost', 0)):.2f}\n")
+        handle.write(f"- Current value: ${float(result.get('total_value', 0)):.2f}\n")
+        handle.write(
+            f"- Unrealized P/L: ${float(result.get('total_unrealized_pnl', 0)):.2f} "
+            f"({float(result.get('total_return_pct', 0)):.2f}%)\n"
+        )
+        handle.write(f"- Winners / losers: {result.get('winners', 0)} / {result.get('losers', 0)}\n\n")
+        if positions:
+            handle.write("| Ticker | Buy Date | Days Held | Cost | Entry | Current | Value | P/L | Return |\n")
+            handle.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+            for item in sorted(positions, key=lambda row: float(row.get("unrealized_pnl", 0)), reverse=True):
+                handle.write(
+                    f"| {item['ticker']} | {item['buy_date']} | {item['holding_days']} | "
+                    f"${float(item['notional']):.2f} | ${float(item['entry_price']):.2f} | "
+                    f"${float(item['current_price']):.2f} | ${float(item['market_value']):.2f} | "
+                    f"${float(item['unrealized_pnl']):.2f} | {float(item['return_pct']):.2f}% |\n"
+                )
+        else:
+            handle.write("No open paper positions yet.\n")
+
+    try:
+        payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(payload, dict):
+        payload["paper_portfolio_performance"] = result
         Path(json_path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
