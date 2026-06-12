@@ -10,7 +10,7 @@ jobs:
   create-daily-report:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       issues: write
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -23,7 +23,8 @@ jobs:
 
       - name: Compute cache key
         id: cache-key
-        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
 
       - name: Restore local cache
         uses: actions/cache@v4
@@ -40,6 +41,22 @@ jobs:
 
       - name: Generate watchlist
         run: python3 -u src/event_bottom_fishing.py --top 10
+
+      - name: Commit paper portfolio database
+        run: |
+          if [ ! -f state/paper_portfolio.sqlite ]; then
+            echo "No paper portfolio database found."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/paper_portfolio.sqlite
+          if git diff --cached --quiet; then
+            echo "No paper portfolio database changes to commit."
+            exit 0
+          fi
+          git commit -m "Update paper portfolio database"
+          git push
 
       - name: Create GitHub issue report
         uses: actions/github-script@v7

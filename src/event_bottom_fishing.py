@@ -37,6 +37,7 @@ from data_sources import (
     load_sec_ticker_map as load_sec_ticker_map_source,
     load_universe as load_universe_source,
 )
+from paper_portfolio import apply_paper_buy, append_paper_buy_to_outputs, archive_report
 from reporting import write_outputs as render_outputs
 
 
@@ -46,6 +47,7 @@ DEFAULT_ALIASES = "auto"
 DEFAULT_UNIVERSE_FALLBACK = os.path.join(ROOT, "config", "universe_sp100.txt")
 DEFAULT_ALIASES_OVERRIDE = os.path.join(ROOT, "config", "company_aliases.json")
 OUTPUT_DIR = os.path.join(ROOT, "outputs")
+DEFAULT_PAPER_PORTFOLIO_DB = os.path.join(ROOT, "state", "paper_portfolio.sqlite")
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -1671,6 +1673,22 @@ def main(argv: Iterable[str] | None = None) -> int:
         default=int(os.environ.get("AGENT_REVIEW_COUNT", os.environ.get("AGENT_LLM_COUNT", "1"))),
         help="Only score this many top candidates with the agent review.",
     )
+    parser.add_argument(
+        "--skip-paper-portfolio",
+        action="store_true",
+        help="Skip the paper portfolio validation buy after report generation.",
+    )
+    parser.add_argument(
+        "--paper-buy-amount",
+        type=float,
+        default=float(os.environ.get("PAPER_BUY_AMOUNT", "100")),
+        help="Paper notional to buy after each report run.",
+    )
+    parser.add_argument(
+        "--paper-portfolio-db",
+        default=os.environ.get("PAPER_PORTFOLIO_DB", DEFAULT_PAPER_PORTFOLIO_DB),
+        help="SQLite DB path for the paper validation portfolio.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     if args.agent_mode is None:
@@ -1691,6 +1709,38 @@ def main(argv: Iterable[str] | None = None) -> int:
     today = dt.datetime.now().strftime("%Y-%m-%d")
     path_prefix = os.path.join(OUTPUT_DIR, f"daily_event_bottom_fishing_{today}")
     json_path, md_path = render_outputs(candidates, path_prefix)
+    paper_result = {"status": "skipped", "position": None, "db_path": args.paper_portfolio_db}
+    if not args.skip_paper_portfolio:
+        paper_result = apply_paper_buy(
+            candidates,
+            db_path=args.paper_portfolio_db,
+            buy_amount=args.paper_buy_amount,
+            run_date=today,
+        )
+        append_paper_buy_to_outputs(md_path, json_path, paper_result)
+        if paper_result["status"] == "bought" and paper_result["position"]:
+            position = paper_result["position"]
+            print(
+                f"[paper] bought {position['ticker']} ${position['notional']:.2f} "
+                f"at ${position['price']:.2f}; shares={position['shares']:.6f}; "
+                f"db={args.paper_portfolio_db}",
+                flush=True,
+            )
+        else:
+            print(f"[paper] no new buy; db={args.paper_portfolio_db}", flush=True)
+    archive_result = archive_report(
+        args.paper_portfolio_db,
+        run_date=today,
+        markdown_path=md_path,
+        json_path=json_path,
+        candidates=candidates,
+        paper_buy_result=paper_result,
+    )
+    print(
+        f"[paper] archived report date={archive_result['run_date']} "
+        f"candidates={archive_result['candidate_count']} db={archive_result['db_path']}",
+        flush=True,
+    )
     print(f"Wrote {md_path}")
     print(f"Wrote {json_path}")
     print()
