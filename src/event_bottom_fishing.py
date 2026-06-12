@@ -31,12 +31,19 @@ from llm_prompts import (
     pct,
 )
 from agent_runtime import apply_agent_reviews as run_agent_reviews
+from data_sources import (
+    load_aliases as load_aliases_source,
+    load_sec_ticker_map as load_sec_ticker_map_source,
+    load_universe as load_universe_source,
+)
 from reporting import write_outputs as render_outputs
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_UNIVERSE = os.path.join(ROOT, "config", "universe_sp100.txt")
-DEFAULT_ALIASES = os.path.join(ROOT, "config", "company_aliases.json")
+DEFAULT_UNIVERSE = "sp500-live"
+DEFAULT_ALIASES = "auto"
+DEFAULT_UNIVERSE_FALLBACK = os.path.join(ROOT, "config", "universe_sp100.txt")
+DEFAULT_ALIASES_OVERRIDE = os.path.join(ROOT, "config", "company_aliases.json")
 OUTPUT_DIR = os.path.join(ROOT, "outputs")
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
@@ -228,21 +235,11 @@ def fetch_sec_url(url: str, timeout: int = 12) -> bytes:
 
 
 def load_universe(path: str) -> list[str]:
-    with open(path, "r", encoding="utf-8") as handle:
-        tickers = []
-        for line in handle:
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                tickers.append(stripped.upper())
-        return tickers
+    return load_universe_source(path, fallback_path=DEFAULT_UNIVERSE_FALLBACK)
 
 
-def load_aliases(path: str) -> dict[str, list[str]]:
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    return {str(key).upper(): [str(item) for item in value] for key, value in payload.items()}
+def load_aliases(path: str, universe: list[str] | None = None) -> dict[str, list[str]]:
+    return load_aliases_source(path, universe=universe, manual_override_path=DEFAULT_ALIASES_OVERRIDE)
 
 
 def parse_rss_date(value: str | None) -> dt.datetime | None:
@@ -408,14 +405,7 @@ def fetch_stooq_price_stats(ticker: str) -> PriceStats | None:
 
 
 def load_sec_ticker_map() -> dict[str, str]:
-    payload = json.loads(fetch_sec_url(SEC_TICKERS_URL).decode("utf-8"))
-    ticker_map = {}
-    for record in payload.values():
-        ticker = str(record.get("ticker", "")).upper()
-        cik = str(record.get("cik_str", "")).zfill(10)
-        if ticker and cik:
-            ticker_map[ticker] = cik
-    return ticker_map
+    return load_sec_ticker_map_source()
 
 
 def fetch_recent_sec_filings(ticker: str, cik_by_ticker: dict[str, str], lookback_days: int) -> list[FilingItem]:
@@ -1582,7 +1572,7 @@ def score_candidate(ticker: str, news: list[NewsItem], price: PriceStats) -> Can
     )
 def scan(args: argparse.Namespace) -> list[Candidate]:
     tickers = load_universe(args.universe)
-    aliases_by_ticker = load_aliases(args.aliases)
+    aliases_by_ticker = load_aliases(args.aliases, universe=tickers)
     candidates = []
     for index, ticker in enumerate(tickers, start=1):
         try:

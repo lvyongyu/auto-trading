@@ -3,7 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import email.utils
 import html
+from functools import lru_cache
+from html.parser import HTMLParser
 import json
+import os
 import re
 import urllib.parse
 import urllib.request
@@ -16,6 +19,8 @@ SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 SEC_USER_AGENT = "auto-trading-research/0.1 lvyongyu@gmail.com"
+SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+LIVE_UNIVERSE_SPEC = {"sp500-live", "live-sp500", "sp500"}
 
 EVENT_KEYWORDS = {
     "earnings_miss": {
@@ -88,7 +93,7 @@ def fetch_sec_url(url: str, timeout: int = 12) -> bytes:
         return response.read()
 
 
-def load_universe(path: str) -> list[str]:
+def load_universe_file(path: str) -> list[str]:
     with open(path, "r", encoding="utf-8") as handle:
         tickers = []
         for line in handle:
@@ -98,15 +103,198 @@ def load_universe(path: str) -> list[str]:
         return tickers
 
 
-def load_aliases(path: str) -> dict[str, list[str]]:
-    if not path or not re.search(r"\.json$", path):
+class _WikiTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: list[list[list[str]]] = []
+        self._inside_table = False
+        self._table_depth = 0
+        self._current_table: list[list[str]] = []
+        self._current_row: list[str] | None = None
+        self._current_cell: list[str] | None = None
+        self._capture_cell = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_map = {key: value or "" for key, value in attrs}
+        if tag == "table":
+            classes = attrs_map.get("class", "")
+            if not self._inside_table and "wikitable" in classes:
+                self._inside_table = True
+                self._table_depth = 1
+                self._current_table = []
+            elif self._inside_table:
+                self._table_depth += 1
+        elif self._inside_table and self._table_depth == 1:
+            if tag == "tr":
+                self._current_row = []
+            elif tag in {"td", "th"} and self._current_row is not None:
+                self._capture_cell = True
+                self._current_cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._inside_table:
+            return
+        if tag == "table":
+            self._table_depth -= 1
+            if self._table_depth == 0:
+                if self._current_table:
+                    self.tables.append(self._current_table)
+                self._inside_table = False
+                self._current_table = []
+                self._current_row = None
+                self._current_cell = None
+                self._capture_cell = False
+        elif self._table_depth == 1:
+            if tag in {"td", "th"} and self._capture_cell:
+                if self._current_row is not None and self._current_cell is not None:
+                    self._current_row.append(" ".join("".join(self._current_cell).split()))
+                self._current_cell = None
+                self._capture_cell = False
+            elif tag == "tr" and self._current_row is not None:
+                if any(cell.strip() for cell in self._current_row):
+                    self._current_table.append(self._current_row)
+                self._current_row = None
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_cell and self._current_cell is not None:
+            self._current_cell.append(data)
+
+
+@lru_cache(maxsize=1)
+def fetch_sp500_universe() -> list[str]:
+    raw = fetch_url(SP500_WIKI_URL)
+    parser = _WikiTableParser()
+    parser.feed(raw.decode("utf-8", errors="ignore"))
+    for table in parser.tables:
+        if not table or len(table[0]) < 2:
+            continue
+        header = [cell.strip().lower() for cell in table[0]]
+        if "symbol" not in header or "security" not in header:
+            continue
+        symbol_index = header.index("symbol")
+        symbols: list[str] = []
+        for row in table[1:]:
+            if len(row) <= symbol_index:
+                continue
+            symbol = row[symbol_index].strip().upper()
+            if not symbol or symbol == "SYMBOL":
+                continue
+            if symbol not in symbols:
+                symbols.append(symbol)
+        if symbols:
+            return symbols
+    raise RuntimeError("Unable to parse live S&P 500 constituents from Wikipedia.")
+
+
+def load_universe(spec: str, fallback_path: str | None = None) -> list[str]:
+    normalized = (spec or "").strip().lower()
+    if normalized in LIVE_UNIVERSE_SPEC:
+        try:
+            return fetch_sp500_universe()
+        except Exception:
+            if fallback_path and os.path.exists(fallback_path):
+                return load_universe_file(fallback_path)
+            raise
+    if os.path.exists(spec):
+        return load_universe_file(spec)
+    if fallback_path and os.path.exists(fallback_path):
+        return load_universe_file(fallback_path)
+    raise FileNotFoundError(spec)
+
+
+def load_alias_file(path: str) -> dict[str, list[str]]:
+    if not path or not re.search(r"\.json$", path) or not os.path.exists(path):
         return {}
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except FileNotFoundError:
-        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
     return {str(key).upper(): [str(item) for item in value] for key, value in payload.items()}
+
+
+@lru_cache(maxsize=1)
+def load_sec_company_records() -> dict[str, dict[str, str]]:
+    payload = json.loads(fetch_sec_url(SEC_TICKERS_URL).decode("utf-8"))
+    records: dict[str, dict[str, str]] = {}
+    for record in payload.values():
+        ticker = str(record.get("ticker", "")).upper()
+        cik = str(record.get("cik_str", "")).zfill(10)
+        title = str(record.get("title", "")).strip()
+        if ticker and cik:
+            records[ticker] = {"cik": cik, "title": title}
+    return records
+
+
+@lru_cache(maxsize=1)
+def load_sec_ticker_map() -> dict[str, str]:
+    return {ticker: record["cik"] for ticker, record in load_sec_company_records().items()}
+
+
+def _clean_company_alias(value: str) -> str:
+    cleaned = html.unescape(value)
+    cleaned = re.sub(r"\s*\((?:the )?company\)\s*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*class [a-z0-9]+\s*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*series [a-z0-9]+\s*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(?:inc|inc\.|corp|corp\.|co|co\.|ltd|ltd\.|plc|limited|corporation|company|holding|holdings|group)\b\.?\s*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    cleaned = re.sub(r"^the\s+", "", cleaned, flags=re.I)
+    return cleaned.strip()
+
+
+def _alias_variants(title: str) -> list[str]:
+    variants = []
+    base = re.sub(r"\s+", " ", html.unescape(title)).strip()
+    if not base:
+        return variants
+    variants.append(base)
+    cleaned = _clean_company_alias(base)
+    if cleaned and cleaned not in variants:
+        variants.append(cleaned)
+    no_parenthetical = re.sub(r"\s*\([^)]*\)", "", cleaned).strip()
+    if no_parenthetical and no_parenthetical not in variants:
+        variants.append(no_parenthetical)
+    for candidate in list(variants):
+        alt = candidate.replace("&", "and")
+        if alt and alt not in variants:
+            variants.append(alt)
+    return [variant for variant in variants if len(variant) >= 2]
+
+
+def build_auto_aliases(universe: list[str] | None = None) -> dict[str, list[str]]:
+    records = load_sec_company_records()
+    selected = universe or list(records)
+    aliases: dict[str, list[str]] = {}
+    for ticker in selected:
+        record = records.get(ticker.upper())
+        if not record:
+            continue
+        variants = _alias_variants(record.get("title", ""))
+        if variants:
+            aliases[ticker.upper()] = variants
+    return aliases
+
+
+def merge_alias_maps(primary: dict[str, list[str]], overrides: dict[str, list[str]]) -> dict[str, list[str]]:
+    merged = {key.upper(): list(dict.fromkeys(value)) for key, value in primary.items()}
+    for ticker, aliases in overrides.items():
+        ticker = ticker.upper()
+        current = merged.setdefault(ticker, [])
+        for alias in aliases:
+            alias = str(alias).strip()
+            if alias and alias not in current:
+                current.append(alias)
+    return merged
+
+
+def load_aliases(spec: str, universe: list[str] | None = None, manual_override_path: str | None = None) -> dict[str, list[str]]:
+    normalized = (spec or "").strip().lower()
+    if normalized == "auto":
+        auto_aliases = build_auto_aliases(universe)
+        manual_aliases = load_alias_file(manual_override_path) if manual_override_path else {}
+        return merge_alias_maps(auto_aliases, manual_aliases)
+    if os.path.exists(spec):
+        return load_alias_file(spec)
+    if manual_override_path and os.path.exists(manual_override_path):
+        return load_alias_file(manual_override_path)
+    return {}
 
 
 def parse_rss_date(value: str | None) -> dt.datetime | None:
@@ -269,17 +457,6 @@ def fetch_stooq_price_stats(ticker: str) -> PriceStats | None:
         above_5d_low=(last / low_5 - 1) * 100,
         volume_ratio_5d_20d=avg_vol_5 / avg_vol_20 if avg_vol_20 else 0,
     )
-
-
-def load_sec_ticker_map() -> dict[str, str]:
-    payload = json.loads(fetch_sec_url(SEC_TICKERS_URL).decode("utf-8"))
-    ticker_map = {}
-    for record in payload.values():
-        ticker = str(record.get("ticker", "")).upper()
-        cik = str(record.get("cik_str", "")).zfill(10)
-        if ticker and cik:
-            ticker_map[ticker] = cik
-    return ticker_map
 
 
 def fetch_recent_sec_filings(ticker: str, cik_by_ticker: dict[str, str], lookback_days: int) -> list[FilingItem]:

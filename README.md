@@ -194,5 +194,6 @@ Always read the actual event context before doing anything with real money.
 
 ## Configuration
 
-For a larger or smaller universe, edit `config/universe_sp100.txt`.
-For company-name matching, edit `config/company_aliases.json`.
+By default the screener uses live S&P 500 membership and auto-generated company aliases.
+If live membership cannot be fetched, it falls back to `config/universe_sp100.txt`.
+If a company name needs a manual patch, use `config/company_aliases.json` as the override layer.

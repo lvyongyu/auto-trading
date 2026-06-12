@@ -57,6 +57,8 @@ Report Writer
 The screener still does the first-pass narrowing.
 The agent runtime then adds structured research, committee-style reasoning, and a final risk-aware recommendation.
 
+In the next clean iteration, the screener should be able to swap its universe source without touching the alias layer, and the alias layer should be able to change without touching the scoring or agent runtime.
+
 ## Repository Layout
 
 The current implementation is split by responsibility:
@@ -70,6 +72,86 @@ The current implementation is split by responsibility:
 - `src/scoring.py`: deterministic scoring helpers
 
 This split matters because it keeps reasoning, retrieval, scoring, and rendering from collapsing into one giant file.
+
+## Clean Boundaries
+
+The clean version of this system should keep five concepts separate.
+
+### Universe
+
+The universe decides which tickers are scanned today.
+
+Examples:
+
+- live S&P 500 membership
+- S&P 100 membership
+- a custom watchlist
+
+Universe code should only answer:
+
+> Which stocks are eligible for screening?
+
+It should not know about news matching, scoring, or reporting.
+
+### Alias Layer
+
+The alias layer decides how a company is recognized in event text.
+
+Examples:
+
+- `AAPL` -> `Apple`
+- `GOOG` / `GOOGL` -> `Alphabet`, `Google`
+- `BRK-B` -> `Berkshire`
+
+Alias code should only answer:
+
+> What words in the text refer to this company?
+
+It should not decide whether the stock is attractive.
+
+### Scoring Layer
+
+The scoring layer decides how interesting the setup is.
+
+It should only answer:
+
+> Is this candidate worth deeper attention?
+
+This layer can use event activity, price context, business quality, valuation, and structural risk.
+It should not manage agent prompts or report layout.
+
+### Agent Layer
+
+The agent layer decides what the setup means.
+
+It should answer:
+
+> What is the strongest bull case, the strongest bear case, and what evidence is still missing?
+
+Agents can call tools, debate each other, and produce a final research judgment.
+They should not fetch raw data inline if that logic belongs to a tool.
+
+### Reporting Layer
+
+The reporting layer decides how the answer is shown.
+
+It should answer:
+
+> What does a human need to see to trust the result?
+
+It should render the decision, evidence, risk, and trace without changing the decision itself.
+
+### Why This Boundary Matters
+
+When these layers stay separate:
+
+- changing universe logic does not break alias matching
+- changing alias logic does not alter scoring
+- changing scoring does not affect agent reasoning
+- changing agent prompts does not alter report format
+- changing report format does not alter the research result
+
+That separation is the main definition of "clean" for this project.
 
 ## Pipeline
 
