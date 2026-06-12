@@ -8,6 +8,7 @@ It uses public, no-key data sources and produces a research watchlist.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import dataclasses
 import datetime as dt
 import email.utils
@@ -1571,33 +1572,51 @@ def score_candidate(ticker: str, news: list[NewsItem], price: PriceStats) -> Can
         events=news,
         price=price,
     )
+
+
+def build_candidate(
+    index: int,
+    ticker: str,
+    aliases_by_ticker: dict[str, list[str]],
+    args: argparse.Namespace,
+) -> tuple[int, Candidate | None, str | None]:
+    try:
+        news = fetch_news(
+            ticker,
+            aliases_by_ticker.get(ticker, []),
+            args.max_news,
+            args.lookback_days,
+            args.allow_broad_news,
+        )
+        if not news:
+            return index, None, None
+        price = fetch_price_stats(ticker)
+        if not price:
+            return index, None, None
+        return index, score_candidate(ticker, news, price), None
+    except Exception as exc:  # noqa: BLE001 - scanner should continue per ticker.
+        return index, None, str(exc)
+
+
 def scan(args: argparse.Namespace) -> list[Candidate]:
     tickers = load_universe(args.universe)
     aliases_by_ticker = load_aliases(args.aliases, universe=tickers)
     candidates = []
-    for index, ticker in enumerate(tickers, start=1):
-        try:
-            news = fetch_news(
-                ticker,
-                aliases_by_ticker.get(ticker, []),
-                args.max_news,
-                args.lookback_days,
-                args.allow_broad_news,
-            )
-            if not news:
-                continue
-            price = fetch_price_stats(ticker)
-            if not price:
-                continue
-            candidate = score_candidate(ticker, news, price)
-            candidates.append(candidate)
-            if args.verbose:
-                print(f"[{index}/{len(tickers)}] {ticker}: {candidate.score:.2f}", flush=True)
-            time.sleep(args.sleep)
-        except Exception as exc:  # noqa: BLE001 - scanner should continue per ticker.
-            if args.verbose:
-                print(f"[{index}/{len(tickers)}] {ticker}: skipped ({exc})", file=sys.stderr, flush=True)
-            continue
+    max_workers = max(1, args.scan_workers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(build_candidate, index, ticker, aliases_by_ticker, args)
+            for index, ticker in enumerate(tickers, start=1)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            index, candidate, error = future.result()
+            ticker = tickers[index - 1]
+            if error and args.verbose:
+                print(f"[{index}/{len(tickers)}] {ticker}: skipped ({error})", file=sys.stderr, flush=True)
+            if candidate:
+                candidates.append(candidate)
+                if args.verbose:
+                    print(f"[{index}/{len(tickers)}] {ticker}: {candidate.score:.2f}", flush=True)
     candidates.sort(key=lambda item: item.score, reverse=True)
     return prepare_selected_candidates(candidates, args)
 
@@ -1611,6 +1630,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--max-news", type=int, default=8)
     parser.add_argument("--deep-dive-focus", type=int, default=3)
     parser.add_argument("--sleep", type=float, default=0.15)
+    parser.add_argument(
+        "--scan-workers",
+        type=int,
+        default=int(os.environ.get("SCAN_WORKERS", "12")),
+        help="Number of parallel ticker fetch workers used during the initial scan.",
+    )
     parser.add_argument("--allow-broad-news", action="store_true")
     parser.add_argument("--include-avoid", action="store_true")
     parser.add_argument("--skip-data-confidence", action="store_true")
