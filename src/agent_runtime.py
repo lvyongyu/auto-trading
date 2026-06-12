@@ -103,6 +103,16 @@ def _mode_uses_final_llm(mode: str) -> bool:
     return mode in {"lean", "full"} and bool(os.environ.get("OPENAI_API_KEY"))
 
 
+def _llm_mode_label(mode: str) -> str:
+    if not os.environ.get("OPENAI_API_KEY"):
+        return "off"
+    if mode == "full":
+        return "on(per-task+final)"
+    if mode == "lean":
+        return "on(final-only)"
+    return "off"
+
+
 def _tool_news(candidate: Candidate) -> ToolResult:
     headlines = candidate.events[:3]
     summary = ", ".join(top_category_labels(count_categories(candidate.events), 4)) or "No clear event catalyst"
@@ -511,8 +521,9 @@ def build_agent_review(candidate: Candidate, token_budget: int, mode: str = "det
     if not candidate.data_confidence.sec_filings:
         candidate.data_confidence.sec_filings = fetch_recent_sec_filings(candidate.ticker, ticker_map, 14)
     _log(
-        f"{candidate.ticker} start mode={mode} deep_dive={candidate.deep_dive_decision} "
-        f"score={candidate.deep_dive_score:.2f} token_budget={token_budget} model={model}"
+        f"{candidate.ticker} start mode={mode} llm={_llm_mode_label(mode)} "
+        f"deep_dive={candidate.deep_dive_decision} score={candidate.deep_dive_score:.2f} "
+        f"token_budget={token_budget} model={model}"
     )
     agent_results: list[AgentResult] = []
     tool_trace: list[ToolResult] = []
@@ -531,8 +542,8 @@ def build_agent_review(candidate: Candidate, token_budget: int, mode: str = "det
             actual_output_tokens += usage.get("output_tokens", 0)
         tool_summary = "; ".join(f"{tool.tool}:{tool.status}" for tool in tool_results) or "no-tools"
         _log(
-            f"{candidate.ticker} task={task.agent} stance={result.stance} conf={result.confidence:.2f} "
-            f"prompt~{prompt_estimate} tool={tool_summary}"
+            f"{candidate.ticker} task={task.agent} llm={'on' if usage else 'off'} "
+            f"stance={result.stance} conf={result.confidence:.2f} prompt~{prompt_estimate} tool={tool_summary}"
         )
 
     evidence_quality_score = 0.45
@@ -601,7 +612,7 @@ def build_agent_review(candidate: Candidate, token_budget: int, mode: str = "det
     total_estimated = estimated_prompt_tokens + estimated_output_tokens
     if actual_input_tokens or actual_output_tokens:
         _log(
-            f"{candidate.ticker} done decision={review.decision} risk={review.risk_rating} "
+            f"{candidate.ticker} done decision={review.decision} risk={review.risk_rating} llm={_llm_mode_label(mode)} "
             f"evidence={review.evidence_quality:.2f} score={review.review_score:.2f} "
             f"tokens actual_in={actual_input_tokens} actual_out={actual_output_tokens} "
             f"task_prompt_estimate={estimated_prompt_tokens} final_review_prompt_estimate={review.prompt_tokens_estimate} "
@@ -609,7 +620,7 @@ def build_agent_review(candidate: Candidate, token_budget: int, mode: str = "det
         )
     else:
         _log(
-            f"{candidate.ticker} done decision={review.decision} risk={review.risk_rating} "
+            f"{candidate.ticker} done decision={review.decision} risk={review.risk_rating} llm={_llm_mode_label(mode)} "
             f"evidence={review.evidence_quality:.2f} score={review.review_score:.2f} "
             f"task_prompt_estimate={estimated_prompt_tokens} final_review_prompt_estimate={review.prompt_tokens_estimate} "
             f"task_total_estimate~{total_estimated}"
@@ -634,7 +645,8 @@ def apply_agent_reviews(candidates: list[Candidate], token_budget: int, mode: st
         total_prompt = sum(candidate.agent_review.prompt_tokens_estimate for candidate in reviewed)
         _log(
             "review batch "
-            f"candidates={len(reviewed)} mode={mode} final_review_prompt_total={total_prompt} "
+            f"candidates={len(reviewed)} mode={mode} llm={_llm_mode_label(mode)} "
+            f"final_review_prompt_total={total_prompt} "
             f"review_count={review_count} model={model}"
         )
     return candidates
