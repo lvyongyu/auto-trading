@@ -220,10 +220,24 @@ def insert_position(conn: sqlite3.Connection, position: dict[str, Any]) -> None:
     conn.commit()
 
 
+def paper_buy_already_recorded(conn: sqlite3.Connection, run_date: str) -> bool:
+    position_row = conn.execute(
+        "SELECT 1 FROM positions WHERE buy_date = ? LIMIT 1",
+        (run_date,),
+    ).fetchone()
+    if position_row:
+        return True
+    skipped_row = conn.execute(
+        "SELECT 1 FROM skipped_runs WHERE run_date = ? LIMIT 1",
+        (run_date,),
+    ).fetchone()
+    return bool(skipped_row)
+
+
 def apply_paper_buy(candidates: list[Candidate], db_path: str, buy_amount: float = DEFAULT_BUY_AMOUNT, run_date: str | None = None) -> dict[str, Any]:
     run_date = run_date or dt.datetime.now().strftime("%Y-%m-%d")
     with connect(db_path) as conn:
-        candidate, skipped_duplicates = select_paper_buy_candidate(candidates, held_tickers(conn))
+        skipped_duplicates: list[str] = []
         result: dict[str, Any] = {
             "run_date": run_date,
             "db_path": db_path,
@@ -233,6 +247,12 @@ def apply_paper_buy(candidates: list[Candidate], db_path: str, buy_amount: float
             "position": None,
             **portfolio_summary(conn),
         }
+        if paper_buy_already_recorded(conn, run_date):
+            result["status"] = "already_recorded"
+            return result
+
+        candidate, skipped_duplicates = select_paper_buy_candidate(candidates, held_tickers(conn))
+        result["skipped_duplicates"] = skipped_duplicates
         if candidate is None:
             conn.execute(
                 """
@@ -373,6 +393,8 @@ def append_paper_buy_to_outputs(markdown_path: str, json_path: str, result: dict
             )
             handle.write(f"- Thesis: {position.get('thesis', '')}\n")
             handle.write(f"- Main risk: {position.get('main_risk', '')}\n")
+        elif result.get("status") == "already_recorded":
+            handle.write("- No new paper buy today; this run date already has a recorded paper decision.\n")
         else:
             handle.write("- No new paper buy today; every eligible ticker was already held or no valid candidate was available.\n")
         if result.get("skipped_duplicates"):
